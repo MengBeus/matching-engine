@@ -59,28 +59,36 @@ func (pl *PriceLevel) IsEmpty() bool {
 
 // OrderBook represents the order book for a symbol
 type OrderBook struct {
-	Symbol    string
-	BidLevels map[int64]*PriceLevel // Buy orders (price -> level)
-	AskLevels map[int64]*PriceLevel // Sell orders (price -> level)
-	Orders    map[string]*Order     // order_id -> Order
-	sequence  int64                 // Event sequence number
+	Symbol       string
+	BidLevels    map[int64]*PriceLevel  // Buy orders (price -> level)
+	AskLevels    map[int64]*PriceLevel  // Sell orders (price -> level)
+	Orders       map[string]*Order      // order_id -> Order
+	closedOrders map[string]OrderStatus // closed order_id -> terminal status
+	eventSeq     int64                  // Event sequence number
+	tradeSeq     int64                  // Trade identifier sequence
 }
 
 // NewOrderBook creates a new order book
 func NewOrderBook(symbol string) *OrderBook {
 	return &OrderBook{
-		Symbol:    symbol,
-		BidLevels: make(map[int64]*PriceLevel),
-		AskLevels: make(map[int64]*PriceLevel),
-		Orders:    make(map[string]*Order),
-		sequence:  0,
+		Symbol:       symbol,
+		BidLevels:    make(map[int64]*PriceLevel),
+		AskLevels:    make(map[int64]*PriceLevel),
+		Orders:       make(map[string]*Order),
+		closedOrders: make(map[string]OrderStatus),
+		eventSeq:     0,
+		tradeSeq:     0,
 	}
 }
 
-// nextSequence returns the next sequence number
-func (ob *OrderBook) nextSequence() int64 {
-	ob.sequence++
-	return ob.sequence
+func (ob *OrderBook) nextEventSequence() int64 {
+	ob.eventSeq++
+	return ob.eventSeq
+}
+
+func (ob *OrderBook) nextTradeID() string {
+	ob.tradeSeq++
+	return fmt.Sprintf("trd_%d", ob.tradeSeq)
 }
 
 // getBestBid returns the highest bid price, or 0 if no bids
@@ -157,6 +165,9 @@ func (ob *OrderBook) PlaceLimit(req *PlaceOrderRequest) (*CommandResult, error) 
 	if _, exists := ob.Orders[req.OrderID]; exists {
 		return nil, fmt.Errorf("duplicate order_id: %s", req.OrderID)
 	}
+	if _, exists := ob.closedOrders[req.OrderID]; exists {
+		return nil, fmt.Errorf("duplicate order_id: %s", req.OrderID)
+	}
 
 	result := &CommandResult{
 		OrderStatusChanges: []OrderStatusChange{},
@@ -182,9 +193,10 @@ func (ob *OrderBook) PlaceLimit(req *PlaceOrderRequest) (*CommandResult, error) 
 	ob.Orders[order.OrderID] = order
 
 	// Generate OrderAccepted event
+	seq := ob.nextEventSequence()
 	acceptedEvent := &OrderAcceptedEvent{
-		EventIDValue:    fmt.Sprintf("evt_%d", ob.nextSequence()),
-		SequenceValue:   ob.sequence,
+		EventIDValue:    fmt.Sprintf("evt_%d", seq),
+		SequenceValue:   seq,
 		SymbolValue:     ob.Symbol,
 		OccurredAtValue: time.Now(),
 		OrderID:         order.OrderID,
@@ -211,6 +223,7 @@ func (ob *OrderBook) PlaceLimit(req *PlaceOrderRequest) (*CommandResult, error) 
 	} else {
 		// Order fully filled, remove from orders map
 		delete(ob.Orders, order.OrderID)
+		ob.closedOrders[order.OrderID] = OrderStatusFilled
 	}
 
 	return result, nil
@@ -252,6 +265,7 @@ func (ob *OrderBook) matchBuyOrder(buyOrder *Order, result *CommandResult) {
 		if sellOrder.RemainingQty == 0 {
 			askLevel.RemoveOrder(sellOrder)
 			delete(ob.Orders, sellOrder.OrderID)
+			ob.closedOrders[sellOrder.OrderID] = OrderStatusFilled
 			ob.removePriceLevelIfEmpty(SideSell, bestAsk)
 		}
 	}
@@ -293,6 +307,7 @@ func (ob *OrderBook) matchSellOrder(sellOrder *Order, result *CommandResult) {
 		if buyOrder.RemainingQty == 0 {
 			bidLevel.RemoveOrder(buyOrder)
 			delete(ob.Orders, buyOrder.OrderID)
+			ob.closedOrders[buyOrder.OrderID] = OrderStatusFilled
 			ob.removePriceLevelIfEmpty(SideBuy, bestBid)
 		}
 	}
@@ -312,7 +327,7 @@ func (ob *OrderBook) executeMatch(makerOrder, takerOrder *Order, price int64, re
 
 	// Generate trade
 	trade := Trade{
-		TradeID:      fmt.Sprintf("trd_%d", ob.nextSequence()),
+		TradeID:      ob.nextTradeID(),
 		Symbol:       ob.Symbol,
 		MakerOrderID: makerOrder.OrderID,
 		TakerOrderID: takerOrder.OrderID,
@@ -325,9 +340,10 @@ func (ob *OrderBook) executeMatch(makerOrder, takerOrder *Order, price int64, re
 	result.Trades = append(result.Trades, trade)
 
 	// Generate OrderMatched event
+	seq := ob.nextEventSequence()
 	matchedEvent := &OrderMatchedEvent{
-		EventIDValue:    fmt.Sprintf("evt_%d", ob.nextSequence()),
-		SequenceValue:   ob.sequence,
+		EventIDValue:    fmt.Sprintf("evt_%d", seq),
+		SequenceValue:   seq,
 		SymbolValue:     ob.Symbol,
 		OccurredAtValue: time.Now(),
 		TradeID:         trade.TradeID,
@@ -383,6 +399,16 @@ func (ob *OrderBook) Cancel(req *CancelOrderRequest) (*CommandResult, error) {
 	if req.Symbol != ob.Symbol {
 		return nil, fmt.Errorf("symbol mismatch: request %s, orderbook %s", req.Symbol, ob.Symbol)
 	}
+	if status, exists := ob.closedOrders[req.OrderID]; exists {
+		switch status {
+		case OrderStatusFilled:
+			return nil, fmt.Errorf("order already filled")
+		case OrderStatusCanceled:
+			return nil, fmt.Errorf("order already canceled")
+		default:
+			return nil, fmt.Errorf("order not found: %s", req.OrderID)
+		}
+	}
 
 	result := &CommandResult{
 		OrderStatusChanges: []OrderStatusChange{},
@@ -429,9 +455,10 @@ func (ob *OrderBook) Cancel(req *CancelOrderRequest) (*CommandResult, error) {
 	})
 
 	// Generate OrderCanceled event
+	seq := ob.nextEventSequence()
 	canceledEvent := &OrderCanceledEvent{
-		EventIDValue:    fmt.Sprintf("evt_%d", ob.nextSequence()),
-		SequenceValue:   ob.sequence,
+		EventIDValue:    fmt.Sprintf("evt_%d", seq),
+		SequenceValue:   seq,
 		SymbolValue:     ob.Symbol,
 		OccurredAtValue: time.Now(),
 		OrderID:         order.OrderID,
@@ -443,6 +470,7 @@ func (ob *OrderBook) Cancel(req *CancelOrderRequest) (*CommandResult, error) {
 
 	// Remove from orders map
 	delete(ob.Orders, order.OrderID)
+	ob.closedOrders[order.OrderID] = OrderStatusCanceled
 
 	return result, nil
 }
