@@ -133,15 +133,17 @@ type OrderStatusChange struct {
 
 // Trade represents a trade execution
 type Trade struct {
-	TradeID      string    // Trade ID
-	Symbol       string    // Trading pair
-	MakerOrderID string    // Maker order ID
-	TakerOrderID string    // Taker order ID
-	Price        int64     // Trade price
-	Quantity     int64     // Trade quantity
-	MakerSide    Side      // Maker side
-	TakerSide    Side      // Taker side
-	OccurredAt   time.Time // Trade time
+	TradeID        string    // Trade ID
+	Symbol         string    // Trading pair
+	MakerOrderID   string    // Maker order ID
+	TakerOrderID   string    // Taker order ID
+	MakerAccountID string    // Maker account ID
+	TakerAccountID string    // Taker account ID
+	Price          int64     // Trade price
+	Quantity       int64     // Trade quantity
+	MakerSide      Side      // Maker side
+	TakerSide      Side      // Taker side
+	OccurredAt     time.Time // Trade time
 }
 
 // Event domain event interface

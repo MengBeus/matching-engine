@@ -551,3 +551,150 @@ func TestIdempotency(t *testing.T) {
 		t.Errorf("Expected frozen %d (only once), got %d", expectedFrozen, balance.Frozen)
 	}
 }
+
+func TestIdempotencyKeyScopedByAccountAndSymbolForOrderID(t *testing.T) {
+	accountSvc := account.NewMemoryService()
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     2,
+		QueueSize:      100,
+		IdempotencyTTL: time.Minute,
+	})
+	defer eng.Close()
+
+	router := NewRouter(accountSvc, eng)
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000})
+	_ = accountSvc.SetBalance("acc2", "USDT", account.Balance{Available: 10000000})
+
+	makeReq := func(accountID string) PlaceOrderResponse {
+		body, _ := json.Marshal(PlaceOrderRequest{
+			ClientOrderID:  "client_" + accountID,
+			AccountID:      accountID,
+			Symbol:         "BTC-USDT",
+			Side:           "BUY",
+			Price:          "43000",
+			Quantity:       "100",
+			IdempotencyKey: "same_key",
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 for %s, got %d body=%s", accountID, w.Code, w.Body.String())
+		}
+		var resp PlaceOrderResponse
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode response failed: %v", err)
+		}
+		return resp
+	}
+
+	resp1 := makeReq("acc1")
+	resp2 := makeReq("acc2")
+	if resp1.OrderID == resp2.OrderID {
+		t.Fatalf("order_id should differ across accounts with same idempotency key")
+	}
+}
+
+func TestPlaceOrder_InvalidSymbolMappedToInvalidArgument(t *testing.T) {
+	accountSvc := account.NewMemoryService()
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     1,
+		QueueSize:      100,
+		IdempotencyTTL: time.Minute,
+	})
+	defer eng.Close()
+
+	router := NewRouter(accountSvc, eng)
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000})
+
+	body, _ := json.Marshal(PlaceOrderRequest{
+		ClientOrderID:  "client1",
+		AccountID:      "acc1",
+		Symbol:         "BTCUSDT", // invalid format
+		Side:           "BUY",
+		Price:          "43000",
+		Quantity:       "100",
+		IdempotencyKey: "idem_invalid_symbol",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
+	}
+	var errResp ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response failed: %v", err)
+	}
+	if errResp.Code != string(ErrorCodeInvalidArgument) {
+		t.Fatalf("expected INVALID_ARGUMENT, got %s", errResp.Code)
+	}
+}
+
+func TestQueryClosedOrderAfterCancel(t *testing.T) {
+	accountSvc := account.NewMemoryService()
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     1,
+		QueueSize:      100,
+		IdempotencyTTL: time.Minute,
+	})
+	defer eng.Close()
+
+	router := NewRouter(accountSvc, eng)
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000})
+
+	placeBody, _ := json.Marshal(PlaceOrderRequest{
+		ClientOrderID:  "client_order_closed",
+		AccountID:      "acc1",
+		Symbol:         "BTC-USDT",
+		Side:           "BUY",
+		Price:          "43000",
+		Quantity:       "100",
+		IdempotencyKey: "idem_closed",
+	})
+	placeReq := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(placeBody))
+	placeReq.Header.Set("Content-Type", "application/json")
+	placeW := httptest.NewRecorder()
+	router.ServeHTTP(placeW, placeReq)
+	if placeW.Code != http.StatusOK {
+		t.Fatalf("place failed: %d %s", placeW.Code, placeW.Body.String())
+	}
+	var placeResp PlaceOrderResponse
+	if err := json.NewDecoder(placeW.Body).Decode(&placeResp); err != nil {
+		t.Fatalf("decode place response failed: %v", err)
+	}
+
+	cancelReq := httptest.NewRequest(
+		http.MethodDelete,
+		fmt.Sprintf("/v1/orders/%s?account_id=acc1&symbol=BTC-USDT", placeResp.OrderID),
+		nil,
+	)
+	cancelW := httptest.NewRecorder()
+	router.ServeHTTP(cancelW, cancelReq)
+	if cancelW.Code != http.StatusOK {
+		t.Fatalf("cancel failed: %d %s", cancelW.Code, cancelW.Body.String())
+	}
+
+	queryReq := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/v1/orders/%s?account_id=acc1&symbol=BTC-USDT", placeResp.OrderID),
+		nil,
+	)
+	queryW := httptest.NewRecorder()
+	router.ServeHTTP(queryW, queryReq)
+	if queryW.Code != http.StatusOK {
+		t.Fatalf("query closed order failed: %d %s", queryW.Code, queryW.Body.String())
+	}
+
+	var queryResp QueryOrderResponse
+	if err := json.NewDecoder(queryW.Body).Decode(&queryResp); err != nil {
+		t.Fatalf("decode query response failed: %v", err)
+	}
+	if queryResp.Status != "CANCELED" {
+		t.Fatalf("expected CANCELED, got %s", queryResp.Status)
+	}
+}

@@ -60,12 +60,12 @@ func (pl *PriceLevel) IsEmpty() bool {
 // OrderBook represents the order book for a symbol
 type OrderBook struct {
 	Symbol       string
-	BidLevels    map[int64]*PriceLevel  // Buy orders (price -> level)
-	AskLevels    map[int64]*PriceLevel  // Sell orders (price -> level)
-	Orders       map[string]*Order      // order_id -> Order
-	closedOrders map[string]OrderStatus // closed order_id -> terminal status
-	eventSeq     int64                  // Event sequence number
-	tradeSeq     int64                  // Trade identifier sequence
+	BidLevels    map[int64]*PriceLevel     // Buy orders (price -> level)
+	AskLevels    map[int64]*PriceLevel     // Sell orders (price -> level)
+	Orders       map[string]*Order         // order_id -> Order
+	closedOrders map[string]*OrderSnapshot // closed order_id -> terminal snapshot
+	eventSeq     int64                     // Event sequence number
+	tradeSeq     int64                     // Trade identifier sequence
 }
 
 // NewOrderBook creates a new order book
@@ -75,7 +75,7 @@ func NewOrderBook(symbol string) *OrderBook {
 		BidLevels:    make(map[int64]*PriceLevel),
 		AskLevels:    make(map[int64]*PriceLevel),
 		Orders:       make(map[string]*Order),
-		closedOrders: make(map[string]OrderStatus),
+		closedOrders: make(map[string]*OrderSnapshot),
 		eventSeq:     0,
 		tradeSeq:     0,
 	}
@@ -223,7 +223,7 @@ func (ob *OrderBook) PlaceLimit(req *PlaceOrderRequest) (*CommandResult, error) 
 	} else {
 		// Order fully filled, remove from orders map
 		delete(ob.Orders, order.OrderID)
-		ob.closedOrders[order.OrderID] = OrderStatusFilled
+		ob.closedOrders[order.OrderID] = ob.buildOrderSnapshot(order)
 	}
 
 	return result, nil
@@ -265,7 +265,7 @@ func (ob *OrderBook) matchBuyOrder(buyOrder *Order, result *CommandResult) {
 		if sellOrder.RemainingQty == 0 {
 			askLevel.RemoveOrder(sellOrder)
 			delete(ob.Orders, sellOrder.OrderID)
-			ob.closedOrders[sellOrder.OrderID] = OrderStatusFilled
+			ob.closedOrders[sellOrder.OrderID] = ob.buildOrderSnapshot(sellOrder)
 			ob.removePriceLevelIfEmpty(SideSell, bestAsk)
 		}
 	}
@@ -307,7 +307,7 @@ func (ob *OrderBook) matchSellOrder(sellOrder *Order, result *CommandResult) {
 		if buyOrder.RemainingQty == 0 {
 			bidLevel.RemoveOrder(buyOrder)
 			delete(ob.Orders, buyOrder.OrderID)
-			ob.closedOrders[buyOrder.OrderID] = OrderStatusFilled
+			ob.closedOrders[buyOrder.OrderID] = ob.buildOrderSnapshot(buyOrder)
 			ob.removePriceLevelIfEmpty(SideBuy, bestBid)
 		}
 	}
@@ -327,15 +327,17 @@ func (ob *OrderBook) executeMatch(makerOrder, takerOrder *Order, price int64, re
 
 	// Generate trade
 	trade := Trade{
-		TradeID:      ob.nextTradeID(),
-		Symbol:       ob.Symbol,
-		MakerOrderID: makerOrder.OrderID,
-		TakerOrderID: takerOrder.OrderID,
-		Price:        price,
-		Quantity:     matchQty,
-		MakerSide:    makerOrder.Side,
-		TakerSide:    takerOrder.Side,
-		OccurredAt:   time.Now(),
+		TradeID:        ob.nextTradeID(),
+		Symbol:         ob.Symbol,
+		MakerOrderID:   makerOrder.OrderID,
+		TakerOrderID:   takerOrder.OrderID,
+		MakerAccountID: makerOrder.AccountID,
+		TakerAccountID: takerOrder.AccountID,
+		Price:          price,
+		Quantity:       matchQty,
+		MakerSide:      makerOrder.Side,
+		TakerSide:      takerOrder.Side,
+		OccurredAt:     time.Now(),
 	}
 	result.Trades = append(result.Trades, trade)
 
@@ -399,8 +401,8 @@ func (ob *OrderBook) Cancel(req *CancelOrderRequest) (*CommandResult, error) {
 	if req.Symbol != ob.Symbol {
 		return nil, fmt.Errorf("symbol mismatch: request %s, orderbook %s", req.Symbol, ob.Symbol)
 	}
-	if status, exists := ob.closedOrders[req.OrderID]; exists {
-		switch status {
+	if closed, exists := ob.closedOrders[req.OrderID]; exists {
+		switch closed.Status {
 		case OrderStatusFilled:
 			return nil, fmt.Errorf("order already filled")
 		case OrderStatusCanceled:
@@ -470,7 +472,7 @@ func (ob *OrderBook) Cancel(req *CancelOrderRequest) (*CommandResult, error) {
 
 	// Remove from orders map
 	delete(ob.Orders, order.OrderID)
-	ob.closedOrders[order.OrderID] = OrderStatusCanceled
+	ob.closedOrders[order.OrderID] = ob.buildOrderSnapshot(order)
 
 	return result, nil
 }
@@ -494,32 +496,34 @@ type OrderSnapshot struct {
 func (ob *OrderBook) GetOrderSnapshot(orderID string) (*OrderSnapshot, error) {
 	// Check active orders first
 	if order, exists := ob.Orders[orderID]; exists {
-		return &OrderSnapshot{
-			OrderID:       order.OrderID,
-			ClientOrderID: order.ClientOrderID,
-			AccountID:     order.AccountID,
-			Symbol:        order.Symbol,
-			Side:          order.Side,
-			Price:         order.Price,
-			Quantity:      order.Quantity,
-			RemainingQty:  order.RemainingQty,
-			FilledQty:     order.Quantity - order.RemainingQty,
-			Status:        order.Status,
-			CreatedAt:     order.CreatedAt,
-		}, nil
+		return ob.buildOrderSnapshot(order), nil
 	}
 
 	// Check closed orders
-	if status, exists := ob.closedOrders[orderID]; exists {
-		// For closed orders, we only have the status
-		// Return a minimal snapshot
-		return &OrderSnapshot{
-			OrderID:      orderID,
-			Symbol:       ob.Symbol,
-			Status:       status,
-			RemainingQty: 0,
-		}, nil
+	if snapshot, exists := ob.closedOrders[orderID]; exists {
+		clone := *snapshot
+		return &clone, nil
 	}
 
 	return nil, fmt.Errorf("order not found: %s", orderID)
+}
+
+func (ob *OrderBook) buildOrderSnapshot(order *Order) *OrderSnapshot {
+	if order == nil {
+		return nil
+	}
+
+	return &OrderSnapshot{
+		OrderID:       order.OrderID,
+		ClientOrderID: order.ClientOrderID,
+		AccountID:     order.AccountID,
+		Symbol:        order.Symbol,
+		Side:          order.Side,
+		Price:         order.Price,
+		Quantity:      order.Quantity,
+		RemainingQty:  order.RemainingQty,
+		FilledQty:     order.Quantity - order.RemainingQty,
+		Status:        order.Status,
+		CreatedAt:     order.CreatedAt,
+	}
 }

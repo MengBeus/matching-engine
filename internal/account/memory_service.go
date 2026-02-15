@@ -7,23 +7,26 @@ import (
 
 // MemoryService is an in-memory implementation of the account service
 type MemoryService struct {
-	mu       sync.RWMutex
-	balances map[string]map[string]*Balance // accountID -> asset -> Balance
-	freezes  map[string]*FreezeRecord       // orderID -> FreezeRecord
+	mu            sync.RWMutex
+	balances      map[string]map[string]*Balance // accountID -> asset -> Balance
+	freezes       map[string]*FreezeRecord       // orderID -> FreezeRecord
+	appliedTrades map[string]struct{}            // symbol|tradeID -> applied marker
 }
 
 // FreezeRecord tracks frozen funds for an order
 type FreezeRecord struct {
-	AccountID string
-	Asset     string
-	Amount    int64
+	AccountID            string
+	Asset                string
+	OriginalFrozenAmount int64
+	FrozenAmount         int64
 }
 
 // NewMemoryService creates a new in-memory account service
 func NewMemoryService() *MemoryService {
 	return &MemoryService{
-		balances: make(map[string]map[string]*Balance),
-		freezes:  make(map[string]*FreezeRecord),
+		balances:      make(map[string]map[string]*Balance),
+		freezes:       make(map[string]*FreezeRecord),
+		appliedTrades: make(map[string]struct{}),
 	}
 }
 
@@ -39,26 +42,10 @@ func (s *MemoryService) CheckAndFreezeForPlace(intent PlaceIntent) error {
 		return err
 	}
 
-	// Determine which asset to freeze and how much
-	var assetToFreeze string
-	var amountToFreeze int64
-
-	if intent.Side == "BUY" {
-		// BUY freezes QUOTE (price * quantity)
-		assetToFreeze = quote
-		// Check for overflow
-		if intent.PriceInt > 0 && intent.QtyInt > 0 {
-			if intent.QtyInt > (1<<63-1)/intent.PriceInt {
-				return ErrInvalidAmount
-			}
-		}
-		amountToFreeze = intent.PriceInt * intent.QtyInt
-	} else {
-		// SELL freezes BASE (quantity)
-		assetToFreeze = base
-		amountToFreeze = intent.QtyInt
+	assetToFreeze, amountToFreeze, err := freezeAmountForPlace(base, quote, intent.Side, intent.PriceInt, intent.QtyInt)
+	if err != nil {
+		return err
 	}
-
 	if amountToFreeze <= 0 {
 		return ErrInvalidAmount
 	}
@@ -68,10 +55,10 @@ func (s *MemoryService) CheckAndFreezeForPlace(intent PlaceIntent) error {
 
 	// Check if this order has already been frozen (idempotency)
 	if existingFreeze, exists := s.freezes[intent.OrderID]; exists {
-		// Verify it's the same account and amount
+		// Verify it's the same request shape; treat as idempotent.
 		if existingFreeze.AccountID == intent.AccountID &&
 			existingFreeze.Asset == assetToFreeze &&
-			existingFreeze.Amount == amountToFreeze {
+			existingFreeze.OriginalFrozenAmount == amountToFreeze {
 			// Already frozen, return success (idempotent)
 			return nil
 		}
@@ -109,9 +96,10 @@ func (s *MemoryService) CheckAndFreezeForPlace(intent PlaceIntent) error {
 
 	// Record the freeze
 	s.freezes[intent.OrderID] = &FreezeRecord{
-		AccountID: intent.AccountID,
-		Asset:     assetToFreeze,
-		Amount:    amountToFreeze,
+		AccountID:            intent.AccountID,
+		Asset:                assetToFreeze,
+		OriginalFrozenAmount: amountToFreeze,
+		FrozenAmount:         amountToFreeze,
 	}
 
 	return nil
@@ -152,12 +140,17 @@ func (s *MemoryService) ReleaseOnCancel(intent CancelIntent) error {
 		return fmt.Errorf("asset balance not found: %s", freeze.Asset)
 	}
 
-	// Unfreeze the funds
-	balance.Frozen -= freeze.Amount
-	balance.Available += freeze.Amount
+	if freeze.FrozenAmount <= 0 {
+		return nil
+	}
+	if balance.Frozen < freeze.FrozenAmount {
+		return fmt.Errorf("frozen balance underflow for order %s", intent.OrderID)
+	}
 
-	// Remove freeze record
-	delete(s.freezes, intent.OrderID)
+	// Unfreeze remaining reserved funds.
+	balance.Frozen -= freeze.FrozenAmount
+	balance.Available += freeze.FrozenAmount
+	freeze.FrozenAmount = 0
 
 	return nil
 }
@@ -165,14 +158,34 @@ func (s *MemoryService) ReleaseOnCancel(intent CancelIntent) error {
 // ApplyTrade applies balance changes after a trade execution
 // Week 4: minimal implementation
 func (s *MemoryService) ApplyTrade(intent TradeIntent) error {
+	if intent.TradeID == "" {
+		return ErrInvalidAmount
+	}
+	if intent.BuyerAccountID == "" || intent.SellerAccountID == "" {
+		return ErrInvalidAmount
+	}
+	if intent.BuyerOrderID == "" || intent.SellerOrderID == "" {
+		return ErrInvalidAmount
+	}
+	if intent.PriceInt <= 0 || intent.QuantityInt <= 0 {
+		return ErrInvalidAmount
+	}
+
 	// Parse symbol
 	base, quote, err := ParseSymbol(intent.Symbol)
 	if err != nil {
 		return err
 	}
+	if intent.QuantityInt > (1<<63-1)/intent.PriceInt {
+		return ErrInvalidAmount
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tradeKey := intent.Symbol + "|" + intent.TradeID
+	if _, exists := s.appliedTrades[tradeKey]; exists {
+		return nil
+	}
 
 	// Calculate trade amounts
 	quoteAmount := intent.PriceInt * intent.QuantityInt
@@ -183,10 +196,11 @@ func (s *MemoryService) ApplyTrade(intent TradeIntent) error {
 	buyerQuote := s.getOrCreateAssetBalance(buyerBalances, quote)
 	buyerBase := s.getOrCreateAssetBalance(buyerBalances, base)
 
-	// Buyer: reduce frozen QUOTE, increase available BASE
-	if buyerQuote.Frozen >= quoteAmount {
-		buyerQuote.Frozen -= quoteAmount
+	// Buyer: reduce frozen QUOTE, increase available BASE.
+	if buyerQuote.Frozen < quoteAmount {
+		return fmt.Errorf("insufficient buyer frozen quote for trade")
 	}
+	buyerQuote.Frozen -= quoteAmount
 	buyerBase.Available += baseAmount
 
 	// Update seller balances: pay BASE, receive QUOTE
@@ -194,11 +208,30 @@ func (s *MemoryService) ApplyTrade(intent TradeIntent) error {
 	sellerBase := s.getOrCreateAssetBalance(sellerBalances, base)
 	sellerQuote := s.getOrCreateAssetBalance(sellerBalances, quote)
 
-	// Seller: reduce frozen BASE, increase available QUOTE
-	if sellerBase.Frozen >= baseAmount {
-		sellerBase.Frozen -= baseAmount
+	// Seller: reduce frozen BASE, increase available QUOTE.
+	if sellerBase.Frozen < baseAmount {
+		return fmt.Errorf("insufficient seller frozen base for trade")
 	}
+	sellerBase.Frozen -= baseAmount
 	sellerQuote.Available += quoteAmount
+
+	// Update per-order freeze trackers for future cancel release correctness.
+	buyerFreeze, buyerExists := s.freezes[intent.BuyerOrderID]
+	if buyerExists {
+		if buyerFreeze.FrozenAmount < quoteAmount {
+			return fmt.Errorf("buyer freeze record underflow for order %s", intent.BuyerOrderID)
+		}
+		buyerFreeze.FrozenAmount -= quoteAmount
+	}
+
+	sellerFreeze, sellerExists := s.freezes[intent.SellerOrderID]
+	if sellerExists {
+		if sellerFreeze.FrozenAmount < baseAmount {
+			return fmt.Errorf("seller freeze record underflow for order %s", intent.SellerOrderID)
+		}
+		sellerFreeze.FrozenAmount -= baseAmount
+	}
+	s.appliedTrades[tradeKey] = struct{}{}
 
 	return nil
 }
@@ -258,4 +291,14 @@ func (s *MemoryService) getOrCreateAssetBalance(accountBalances map[string]*Bala
 		accountBalances[asset] = balance
 	}
 	return balance
+}
+
+func freezeAmountForPlace(base, quote, side string, priceInt, qtyInt int64) (string, int64, error) {
+	if side == "BUY" {
+		if priceInt > 0 && qtyInt > 0 && qtyInt > (1<<63-1)/priceInt {
+			return "", 0, ErrInvalidAmount
+		}
+		return quote, priceInt * qtyInt, nil
+	}
+	return base, qtyInt, nil
 }

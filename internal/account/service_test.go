@@ -272,10 +272,10 @@ func TestConcurrentFreezeAndRelease(t *testing.T) {
 
 func TestParseSymbol(t *testing.T) {
 	tests := []struct {
-		symbol      string
-		wantBase    string
-		wantQuote   string
-		wantErr     bool
+		symbol    string
+		wantBase  string
+		wantQuote string
+		wantErr   bool
 	}{
 		{"BTC-USDT", "BTC", "USDT", false},
 		{"ETH-USDT", "ETH", "USDT", false},
@@ -302,5 +302,121 @@ func TestParseSymbol(t *testing.T) {
 				t.Errorf("ParseSymbol(%s) quote = %s, want %s", tt.symbol, quote, tt.wantQuote)
 			}
 		}
+	}
+}
+
+func TestApplyTradeAndReleaseRemainingOnCancel(t *testing.T) {
+	svc := NewMemoryService()
+
+	if err := svc.SetBalance("buyer", "USDT", Balance{Available: 10000, Frozen: 0}); err != nil {
+		t.Fatalf("SetBalance buyer USDT failed: %v", err)
+	}
+	if err := svc.SetBalance("seller", "BTC", Balance{Available: 10, Frozen: 0}); err != nil {
+		t.Fatalf("SetBalance seller BTC failed: %v", err)
+	}
+
+	// buyer freezes 100 * 10 = 1000 USDT
+	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
+		AccountID: "buyer",
+		OrderID:   "buy-order-1",
+		Symbol:    "BTC-USDT",
+		Side:      "BUY",
+		PriceInt:  100,
+		QtyInt:    10,
+	}); err != nil {
+		t.Fatalf("freeze buyer failed: %v", err)
+	}
+
+	// seller freezes 10 BTC
+	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
+		AccountID: "seller",
+		OrderID:   "sell-order-1",
+		Symbol:    "BTC-USDT",
+		Side:      "SELL",
+		PriceInt:  100,
+		QtyInt:    10,
+	}); err != nil {
+		t.Fatalf("freeze seller failed: %v", err)
+	}
+
+	// Match 4 units at price 100.
+	if err := svc.ApplyTrade(TradeIntent{
+		TradeID:         "trd_1",
+		BuyerAccountID:  "buyer",
+		SellerAccountID: "seller",
+		BuyerOrderID:    "buy-order-1",
+		SellerOrderID:   "sell-order-1",
+		Symbol:          "BTC-USDT",
+		PriceInt:        100,
+		QuantityInt:     4,
+	}); err != nil {
+		t.Fatalf("ApplyTrade failed: %v", err)
+	}
+
+	// Buyer cancel should release only remaining frozen amount (600), not full 1000.
+	if err := svc.ReleaseOnCancel(CancelIntent{
+		AccountID: "buyer",
+		OrderID:   "buy-order-1",
+		Symbol:    "BTC-USDT",
+	}); err != nil {
+		t.Fatalf("ReleaseOnCancel failed: %v", err)
+	}
+
+	buyerUSDT, _ := svc.GetBalance("buyer", "USDT")
+	if buyerUSDT.Frozen != 0 {
+		t.Fatalf("expected buyer frozen quote 0, got %d", buyerUSDT.Frozen)
+	}
+	// Initial 10000 - executed quote 400 = 9600
+	if buyerUSDT.Available != 9600 {
+		t.Fatalf("expected buyer available quote 9600, got %d", buyerUSDT.Available)
+	}
+
+	buyerBTC, _ := svc.GetBalance("buyer", "BTC")
+	if buyerBTC.Available != 4 {
+		t.Fatalf("expected buyer base received 4, got %d", buyerBTC.Available)
+	}
+}
+
+func TestApplyTradeIsIdempotentByTradeID(t *testing.T) {
+	svc := NewMemoryService()
+
+	if err := svc.SetBalance("buyer", "USDT", Balance{Available: 1000, Frozen: 0}); err != nil {
+		t.Fatalf("SetBalance buyer USDT failed: %v", err)
+	}
+	if err := svc.SetBalance("seller", "BTC", Balance{Available: 5, Frozen: 0}); err != nil {
+		t.Fatalf("SetBalance seller BTC failed: %v", err)
+	}
+
+	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
+		AccountID: "buyer", OrderID: "b1", Symbol: "BTC-USDT", Side: "BUY", PriceInt: 100, QtyInt: 5,
+	}); err != nil {
+		t.Fatalf("freeze buyer failed: %v", err)
+	}
+	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
+		AccountID: "seller", OrderID: "s1", Symbol: "BTC-USDT", Side: "SELL", PriceInt: 100, QtyInt: 5,
+	}); err != nil {
+		t.Fatalf("freeze seller failed: %v", err)
+	}
+
+	trade := TradeIntent{
+		TradeID:         "same-trade",
+		BuyerAccountID:  "buyer",
+		SellerAccountID: "seller",
+		BuyerOrderID:    "b1",
+		SellerOrderID:   "s1",
+		Symbol:          "BTC-USDT",
+		PriceInt:        100,
+		QuantityInt:     1,
+	}
+	if err := svc.ApplyTrade(trade); err != nil {
+		t.Fatalf("first ApplyTrade failed: %v", err)
+	}
+	if err := svc.ApplyTrade(trade); err != nil {
+		t.Fatalf("second ApplyTrade should be idempotent, got: %v", err)
+	}
+
+	buyerUSDT, _ := svc.GetBalance("buyer", "USDT")
+	if buyerUSDT.Available != 500 {
+		t.Fatalf("expected buyer available quote 500, got %d", buyerUSDT.Available)
 	}
 }

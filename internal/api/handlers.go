@@ -57,8 +57,8 @@ func (h *Handler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate system order ID (deterministic based on idempotency key for proper idempotency)
-	orderID := generateOrderIDFromIdempotencyKey(req.IdempotencyKey)
+	// Generate deterministic order ID in scoped namespace to avoid cross-account collisions.
+	orderID := generateOrderIDFromIdempotencyKey(req.AccountID, req.Symbol, req.IdempotencyKey)
 
 	// Step 1: Check and freeze balance
 	placeIntent := account.PlaceIntent{
@@ -123,6 +123,10 @@ func (h *Handler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 		// Rollback freeze
 		h.rollbackFreeze(orderID, req.AccountID, req.Symbol)
 		writeErrorResponse(w, http.StatusInternalServerError, ErrorCodeInternalError, "invalid result type")
+		return
+	}
+	if err := h.applyTrades(matchResult.Trades); err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrorCodeInternalError, "failed to settle trade balances")
 		return
 	}
 
@@ -311,6 +315,34 @@ func (h *Handler) rollbackFreeze(orderID, accountID, symbol string) {
 	_ = h.accountSvc.ReleaseOnCancel(cancelIntent)
 }
 
+func (h *Handler) applyTrades(trades []matching.Trade) error {
+	for _, trade := range trades {
+		intent := account.TradeIntent{
+			TradeID:     trade.TradeID,
+			Symbol:      trade.Symbol,
+			PriceInt:    trade.Price,
+			QuantityInt: trade.Quantity,
+		}
+
+		if trade.MakerSide == matching.SideBuy {
+			intent.BuyerAccountID = trade.MakerAccountID
+			intent.BuyerOrderID = trade.MakerOrderID
+			intent.SellerAccountID = trade.TakerAccountID
+			intent.SellerOrderID = trade.TakerOrderID
+		} else {
+			intent.BuyerAccountID = trade.TakerAccountID
+			intent.BuyerOrderID = trade.TakerOrderID
+			intent.SellerAccountID = trade.MakerAccountID
+			intent.SellerOrderID = trade.MakerOrderID
+		}
+
+		if err := h.accountSvc.ApplyTrade(intent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (h *Handler) buildPlaceOrderResponse(orderID string, req *PlaceOrderRequest, priceInt, qtyInt int64, result *matching.CommandResult) PlaceOrderResponse {
 	// Determine final status
 	status := "NEW"
@@ -419,11 +451,11 @@ func generateOrderID() string {
 	return "ord_" + uuid.New().String()
 }
 
-func generateOrderIDFromIdempotencyKey(idempotencyKey string) string {
-	// Generate deterministic UUID from idempotency key using UUID v5 (SHA-1 based)
-	// This ensures the same idempotency key always generates the same order ID
+func generateOrderIDFromIdempotencyKey(accountID, symbol, idempotencyKey string) string {
+	// Scope deterministic ID by account+symbol+idempotency_key to avoid cross-account collisions.
+	keyMaterial := accountID + "|" + symbol + "|" + idempotencyKey
 	namespace := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8") // DNS namespace UUID
-	deterministicUUID := uuid.NewSHA1(namespace, []byte(idempotencyKey))
+	deterministicUUID := uuid.NewSHA1(namespace, []byte(keyMaterial))
 	return "ord_" + deterministicUUID.String()
 }
 

@@ -74,8 +74,11 @@ func (c *CancelIntent) Validate() error {
 
 // TradeIntent represents a trade execution that affects balances
 type TradeIntent struct {
+	TradeID         string
 	BuyerAccountID  string
 	SellerAccountID string
+	BuyerOrderID    string
+	SellerOrderID   string
 	Symbol          string
 	PriceInt        int64
 	QuantityInt     int64
@@ -85,7 +88,7 @@ type TradeIntent struct {
 func ParseSymbol(symbol string) (base, quote string, err error) {
 	parts := strings.Split(symbol, "-")
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid symbol format: %s", symbol)
+		return "", "", fmt.Errorf("%w: %s", ErrInvalidSymbol, symbol)
 	}
 	return parts[0], parts[1], nil
 }
