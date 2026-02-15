@@ -2,8 +2,6 @@ package engine
 
 import (
 	"time"
-
-	"matching-engine/internal/matching"
 )
 
 // CommandType represents the type of command
@@ -12,6 +10,7 @@ type CommandType string
 const (
 	CommandTypePlace  CommandType = "PLACE"
 	CommandTypeCancel CommandType = "CANCEL"
+	CommandTypeQuery  CommandType = "QUERY"
 )
 
 // CommandEnvelope wraps a command with metadata
@@ -41,7 +40,7 @@ const (
 
 // CommandExecResult represents the result of command execution
 type CommandExecResult struct {
-	Result    *matching.CommandResult // Matching engine result
-	ErrorCode ErrorCode               // Error code if execution failed
-	Err       error                   // Detailed error message
+	Result    any       // Matching engine result (CommandResult for place/cancel, OrderSnapshot for query)
+	ErrorCode ErrorCode // Error code if execution failed
+	Err       error     // Detailed error message
 }

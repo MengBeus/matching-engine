@@ -156,6 +156,8 @@ func (s *Shard) processCommand(envelope *CommandEnvelope) *CommandExecResult {
 		result = s.executePlace(envelope)
 	case CommandTypeCancel:
 		result = s.executeCancel(envelope)
+	case CommandTypeQuery:
+		result = s.executeQuery(envelope)
 	default:
 		result = &CommandExecResult{
 			Result:    nil,
@@ -240,6 +242,66 @@ func (s *Shard) executeCancel(envelope *CommandEnvelope) *CommandExecResult {
 
 	return &CommandExecResult{
 		Result:    matchResult,
+		ErrorCode: ErrorCodeNone,
+		Err:       nil,
+	}
+}
+
+// executeQuery executes a query order command
+func (s *Shard) executeQuery(envelope *CommandEnvelope) *CommandExecResult {
+	// Extract payload
+	req, ok := envelope.Payload.(*matching.QueryOrderRequest)
+	if !ok {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("invalid payload type for QUERY command"),
+		}
+	}
+
+	// Validate request
+	if err := req.Validate(); err != nil {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       err,
+		}
+	}
+
+	// Get order book for symbol
+	book, exists := s.books[envelope.Symbol]
+	if !exists {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeOrderNotFound,
+			Err:       fmt.Errorf("order book not found for symbol: %s", envelope.Symbol),
+		}
+	}
+
+	// Query order snapshot
+	snapshot, err := book.GetOrderSnapshot(req.OrderID)
+	if err != nil {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: s.mapErrorCode(err),
+			Err:       err,
+		}
+	}
+
+	// Verify account authorization
+	if snapshot.AccountID != req.AccountID {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeUnauthorized,
+			Err:       fmt.Errorf("unauthorized: order belongs to different account"),
+		}
+	}
+
+	// Return snapshot as result
+	// Note: We wrap the snapshot in a CommandResult-like structure
+	// The API layer will extract the snapshot from the result
+	return &CommandExecResult{
+		Result:    snapshot,
 		ErrorCode: ErrorCodeNone,
 		Err:       nil,
 	}

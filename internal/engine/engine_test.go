@@ -9,6 +9,18 @@ import (
 	"matching-engine/internal/matching"
 )
 
+// Helper function to extract CommandResult from Result field
+func getCommandResult(t *testing.T, result *CommandExecResult) *matching.CommandResult {
+	if result == nil || result.Result == nil {
+		return nil
+	}
+	cmdResult, ok := result.Result.(*matching.CommandResult)
+	if !ok {
+		t.Fatalf("Expected *matching.CommandResult, got %T", result.Result)
+	}
+	return cmdResult
+}
+
 // TestRouting tests that routing is stable and deterministic
 func TestRouting(t *testing.T) {
 	router := NewRouter(8)
@@ -90,7 +102,11 @@ func TestIdempotency(t *testing.T) {
 	if result1.Result == nil {
 		t.Fatalf("First submission should return result")
 	}
-	if len(result1.Result.Events) == 0 {
+	cmdResult1, ok := result1.Result.(*matching.CommandResult)
+	if !ok {
+		t.Fatalf("Expected *matching.CommandResult, got %T", result1.Result)
+	}
+	if len(cmdResult1.Events) == 0 {
 		t.Errorf("First submission should generate events")
 	}
 
@@ -117,8 +133,12 @@ func TestIdempotency(t *testing.T) {
 	// Verify order was only created once (not duplicated)
 	// We can't directly check the order book, but we can verify the result is identical
 	if result1.Result != nil && result2.Result != nil {
-		if len(result1.Result.Events) != len(result2.Result.Events) {
-			t.Errorf("Cached result should match original result")
+		cmdResult1, ok1 := result1.Result.(*matching.CommandResult)
+		cmdResult2, ok2 := result2.Result.(*matching.CommandResult)
+		if ok1 && ok2 {
+			if len(cmdResult1.Events) != len(cmdResult2.Events) {
+				t.Errorf("Cached result should match original result")
+			}
 		}
 	}
 
@@ -231,8 +251,8 @@ func TestConcurrencyIsolation(t *testing.T) {
 			}
 
 			// Verify trade occurred
-			if len(sellResult.Result.Trades) != 1 {
-				t.Errorf("Expected 1 trade for %s, got %d", sym, len(sellResult.Result.Trades))
+			if len(getCommandResult(t, sellResult).Trades) != 1 {
+				t.Errorf("Expected 1 trade for %s, got %d", sym, len(getCommandResult(t, sellResult).Trades))
 			}
 		}(i, symbol)
 	}
@@ -444,7 +464,7 @@ func TestMatchingAcrossEngine(t *testing.T) {
 	if buyResult.ErrorCode != ErrorCodeNone {
 		t.Fatalf("Buy order failed: %v", buyResult.Err)
 	}
-	if len(buyResult.Result.Trades) != 0 {
+	if len(getCommandResult(t, buyResult).Trades) != 0 {
 		t.Errorf("Buy order should not match yet")
 	}
 
@@ -477,17 +497,17 @@ func TestMatchingAcrossEngine(t *testing.T) {
 	}
 
 	// Verify trade occurred
-	if len(sellResult.Result.Trades) != 1 {
-		t.Errorf("Expected 1 trade, got %d", len(sellResult.Result.Trades))
+	if len(getCommandResult(t, sellResult).Trades) != 1 {
+		t.Errorf("Expected 1 trade, got %d", len(getCommandResult(t, sellResult).Trades))
 	}
-	if sellResult.Result.Trades[0].Quantity != 50 {
-		t.Errorf("Expected trade quantity 50, got %d", sellResult.Result.Trades[0].Quantity)
+	if getCommandResult(t, sellResult).Trades[0].Quantity != 50 {
+		t.Errorf("Expected trade quantity 50, got %d", getCommandResult(t, sellResult).Trades[0].Quantity)
 	}
-	if sellResult.Result.Trades[0].MakerOrderID != "buy1" {
-		t.Errorf("Expected maker order buy1, got %s", sellResult.Result.Trades[0].MakerOrderID)
+	if getCommandResult(t, sellResult).Trades[0].MakerOrderID != "buy1" {
+		t.Errorf("Expected maker order buy1, got %s", getCommandResult(t, sellResult).Trades[0].MakerOrderID)
 	}
-	if sellResult.Result.Trades[0].TakerOrderID != "sell1" {
-		t.Errorf("Expected taker order sell1, got %s", sellResult.Result.Trades[0].TakerOrderID)
+	if getCommandResult(t, sellResult).Trades[0].TakerOrderID != "sell1" {
+		t.Errorf("Expected taker order sell1, got %s", getCommandResult(t, sellResult).Trades[0].TakerOrderID)
 	}
 }
 
@@ -658,7 +678,7 @@ func TestCachedResultIsImmutableToCallerMutation(t *testing.T) {
 	}
 
 	// Mutate caller-visible object intentionally; cached result must stay unchanged.
-	first.Result.Events = append(first.Result.Events, &matching.OrderCanceledEvent{
+	getCommandResult(t, first).Events = append(getCommandResult(t, first).Events, &matching.OrderCanceledEvent{
 		EventIDValue:    "evt_fake",
 		SequenceValue:   999999,
 		SymbolValue:     "BTC-USDT",
@@ -686,7 +706,7 @@ func TestCachedResultIsImmutableToCallerMutation(t *testing.T) {
 	if second.Result == nil {
 		t.Fatalf("second result must not be nil")
 	}
-	if len(second.Result.Events) != 1 {
-		t.Fatalf("cached result should not be polluted by caller mutation, got %d events", len(second.Result.Events))
+	if len(getCommandResult(t, second).Events) != 1 {
+		t.Fatalf("cached result should not be polluted by caller mutation, got %d events", len(getCommandResult(t, second).Events))
 	}
 }

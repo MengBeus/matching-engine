@@ -7,8 +7,18 @@ func cloneCommandExecResult(in *CommandExecResult) *CommandExecResult {
 		return nil
 	}
 
+	var clonedResult any
+	switch r := in.Result.(type) {
+	case *matching.CommandResult:
+		clonedResult = cloneCommandResult(r)
+	case *matching.OrderSnapshot:
+		clonedResult = cloneOrderSnapshot(r)
+	default:
+		clonedResult = in.Result
+	}
+
 	return &CommandExecResult{
-		Result:    cloneCommandResult(in.Result),
+		Result:    clonedResult,
 		ErrorCode: in.ErrorCode,
 		Err:       in.Err,
 	}
@@ -30,6 +40,15 @@ func cloneCommandResult(in *matching.CommandResult) *matching.CommandResult {
 	}
 
 	return out
+}
+
+func cloneOrderSnapshot(in *matching.OrderSnapshot) *matching.OrderSnapshot {
+	if in == nil {
+		return nil
+	}
+
+	cp := *in
+	return &cp
 }
 
 func cloneEvent(evt matching.Event) matching.Event {

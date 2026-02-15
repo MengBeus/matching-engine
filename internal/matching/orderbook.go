@@ -474,3 +474,52 @@ func (ob *OrderBook) Cancel(req *CancelOrderRequest) (*CommandResult, error) {
 
 	return result, nil
 }
+
+// OrderSnapshot represents a snapshot of an order's current state
+type OrderSnapshot struct {
+	OrderID       string
+	ClientOrderID string
+	AccountID     string
+	Symbol        string
+	Side          Side
+	Price         int64
+	Quantity      int64
+	RemainingQty  int64
+	FilledQty     int64
+	Status        OrderStatus
+	CreatedAt     time.Time
+}
+
+// GetOrderSnapshot returns a snapshot of an order's current state
+func (ob *OrderBook) GetOrderSnapshot(orderID string) (*OrderSnapshot, error) {
+	// Check active orders first
+	if order, exists := ob.Orders[orderID]; exists {
+		return &OrderSnapshot{
+			OrderID:       order.OrderID,
+			ClientOrderID: order.ClientOrderID,
+			AccountID:     order.AccountID,
+			Symbol:        order.Symbol,
+			Side:          order.Side,
+			Price:         order.Price,
+			Quantity:      order.Quantity,
+			RemainingQty:  order.RemainingQty,
+			FilledQty:     order.Quantity - order.RemainingQty,
+			Status:        order.Status,
+			CreatedAt:     order.CreatedAt,
+		}, nil
+	}
+
+	// Check closed orders
+	if status, exists := ob.closedOrders[orderID]; exists {
+		// For closed orders, we only have the status
+		// Return a minimal snapshot
+		return &OrderSnapshot{
+			OrderID:      orderID,
+			Symbol:       ob.Symbol,
+			Status:       status,
+			RemainingQty: 0,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("order not found: %s", orderID)
+}

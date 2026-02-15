@@ -94,6 +94,27 @@ func (r *CancelOrderRequest) Validate() error {
 	return nil
 }
 
+// QueryOrderRequest query order request
+type QueryOrderRequest struct {
+	OrderID   string // Order ID
+	AccountID string // Account ID (for permission check)
+	Symbol    string // Trading pair
+}
+
+// Validate validates query order request
+func (r *QueryOrderRequest) Validate() error {
+	if r.OrderID == "" {
+		return errors.New("order_id required")
+	}
+	if r.AccountID == "" {
+		return errors.New("account_id required")
+	}
+	if r.Symbol == "" {
+		return errors.New("symbol required")
+	}
+	return nil
+}
+
 // CommandResult command execution result
 type CommandResult struct {
 	OrderStatusChanges []OrderStatusChange // Order status changes

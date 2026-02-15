@@ -2,16 +2,33 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
+	"time"
 
+	"matching-engine/internal/account"
 	"matching-engine/internal/api"
+	"matching-engine/internal/engine"
 )
 
 func main() {
-	router := api.NewRouter()
+	// Initialize account service
+	accountSvc := account.NewMemoryService()
+
+	// Initialize engine
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     8,
+		QueueSize:      1000,
+		IdempotencyTTL: 24 * time.Hour,
+	})
+	defer eng.Close()
+
+	// Create router
+	router := api.NewRouter(accountSvc, eng)
 	addr := getenv("APP_ADDR", ":8080")
 
-	if err := router.Run(addr); err != nil {
+	log.Printf("Starting server on %s", addr)
+	if err := http.ListenAndServe(addr, router); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
 }
