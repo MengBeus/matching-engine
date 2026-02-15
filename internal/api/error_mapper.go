@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"matching-engine/internal/account"
 	"matching-engine/internal/engine"
@@ -31,16 +32,23 @@ func MapErrorToHTTP(err error) (int, ErrorResponse) {
 	// Check for account service errors
 	var insufficientBalanceErr *account.InsufficientBalanceError
 	if errors.As(err, &insufficientBalanceErr) {
-		return http.StatusBadRequest, ErrorResponse{
+		return http.StatusConflict, ErrorResponse{
 			Code:    string(ErrorCodeInsufficientBalance),
 			Message: err.Error(),
 		}
 	}
 
 	if errors.Is(err, account.ErrInsufficientBalance) {
-		return http.StatusBadRequest, ErrorResponse{
+		return http.StatusConflict, ErrorResponse{
 			Code:    string(ErrorCodeInsufficientBalance),
 			Message: "insufficient balance",
+		}
+	}
+
+	if strings.Contains(strings.ToLower(err.Error()), "already exists with different parameters") {
+		return http.StatusConflict, ErrorResponse{
+			Code:    string(ErrorCodeDuplicateRequest),
+			Message: "duplicate request with different payload",
 		}
 	}
 
@@ -91,13 +99,13 @@ func MapEngineErrorToHTTP(errorCode engine.ErrorCode, err error) (int, ErrorResp
 		}
 
 	case engine.ErrorCodeOrderAlreadyFilled:
-		return http.StatusBadRequest, ErrorResponse{
+		return http.StatusConflict, ErrorResponse{
 			Code:    string(ErrorCodeOrderAlreadyFilled),
 			Message: getErrorMessage(err, "order already filled"),
 		}
 
 	case engine.ErrorCodeOrderAlreadyCanceled:
-		return http.StatusBadRequest, ErrorResponse{
+		return http.StatusConflict, ErrorResponse{
 			Code:    string(ErrorCodeOrderAlreadyCanceled),
 			Message: getErrorMessage(err, "order already canceled"),
 		}

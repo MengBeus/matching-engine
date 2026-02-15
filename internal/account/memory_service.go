@@ -2,7 +2,10 @@ package account
 
 import (
 	"fmt"
+	"math/big"
 	"sync"
+
+	"matching-engine/internal/symbolspec"
 )
 
 // MemoryService is an in-memory implementation of the account service
@@ -41,8 +44,11 @@ func (s *MemoryService) CheckAndFreezeForPlace(intent PlaceIntent) error {
 	if err != nil {
 		return err
 	}
+	if _, err := symbolspec.Get(intent.Symbol); err != nil {
+		return err
+	}
 
-	assetToFreeze, amountToFreeze, err := freezeAmountForPlace(base, quote, intent.Side, intent.PriceInt, intent.QtyInt)
+	assetToFreeze, amountToFreeze, err := freezeAmountForPlace(intent.Symbol, base, quote, intent.Side, intent.PriceInt, intent.QtyInt)
 	if err != nil {
 		return err
 	}
@@ -176,8 +182,9 @@ func (s *MemoryService) ApplyTrade(intent TradeIntent) error {
 	if err != nil {
 		return err
 	}
-	if intent.QuantityInt > (1<<63-1)/intent.PriceInt {
-		return ErrInvalidAmount
+	spec, err := symbolspec.Get(intent.Symbol)
+	if err != nil {
+		return err
 	}
 
 	s.mu.Lock()
@@ -188,7 +195,10 @@ func (s *MemoryService) ApplyTrade(intent TradeIntent) error {
 	}
 
 	// Calculate trade amounts
-	quoteAmount := intent.PriceInt * intent.QuantityInt
+	quoteAmount, err := quoteAmountFromTrade(intent.PriceInt, intent.QuantityInt, spec.QuantityScale)
+	if err != nil {
+		return err
+	}
 	baseAmount := intent.QuantityInt
 
 	// Update buyer balances: pay QUOTE, receive BASE
@@ -293,12 +303,51 @@ func (s *MemoryService) getOrCreateAssetBalance(accountBalances map[string]*Bala
 	return balance
 }
 
-func freezeAmountForPlace(base, quote, side string, priceInt, qtyInt int64) (string, int64, error) {
+func freezeAmountForPlace(symbol, base, quote, side string, priceInt, qtyInt int64) (string, int64, error) {
 	if side == "BUY" {
-		if priceInt > 0 && qtyInt > 0 && qtyInt > (1<<63-1)/priceInt {
-			return "", 0, ErrInvalidAmount
+		spec, err := symbolspec.Get(symbol)
+		if err != nil {
+			return "", 0, err
 		}
-		return quote, priceInt * qtyInt, nil
+		amount, err := quoteAmountFromTrade(priceInt, qtyInt, spec.QuantityScale)
+		if err != nil {
+			return "", 0, err
+		}
+		return quote, amount, nil
 	}
 	return base, qtyInt, nil
+}
+
+func quoteAmountFromTrade(priceInt, qtyInt int64, qtyScale int) (int64, error) {
+	if priceInt <= 0 || qtyInt <= 0 {
+		return 0, ErrInvalidAmount
+	}
+	denom, err := symbolspec.Pow10(qtyScale)
+	if err != nil {
+		return 0, ErrInvalidAmount
+	}
+	if denom <= 0 {
+		return 0, ErrInvalidAmount
+	}
+
+	price := big.NewInt(priceInt)
+	qty := big.NewInt(qtyInt)
+	product := new(big.Int).Mul(price, qty)
+	divisor := big.NewInt(denom)
+
+	quotient := new(big.Int)
+	remainder := new(big.Int)
+	quotient.QuoRem(product, divisor, remainder)
+	if remainder.Sign() > 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+
+	if !quotient.IsInt64() {
+		return 0, ErrInvalidAmount
+	}
+	amount := quotient.Int64()
+	if amount <= 0 {
+		return 0, ErrInvalidAmount
+	}
+	return amount, nil
 }

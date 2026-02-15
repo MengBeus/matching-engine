@@ -22,8 +22,8 @@ type PlaceIntent struct {
 	OrderID     string
 	Symbol      string // e.g., "BTC-USDT"
 	Side        string // "BUY" or "SELL"
-	PriceInt    int64
-	QtyInt      int64
+	PriceInt    int64  // fixed-scale price, precision from symbol spec
+	QtyInt      int64  // fixed-scale quantity, precision from symbol spec
 	IdemKey     string
 	PayloadHash string
 }
@@ -80,8 +80,8 @@ type TradeIntent struct {
 	BuyerOrderID    string
 	SellerOrderID   string
 	Symbol          string
-	PriceInt        int64
-	QuantityInt     int64
+	PriceInt        int64 // fixed-scale price, precision from symbol spec
+	QuantityInt     int64 // fixed-scale quantity, precision from symbol spec
 }
 
 // ParseSymbol splits a symbol like "BTC-USDT" into base and quote assets

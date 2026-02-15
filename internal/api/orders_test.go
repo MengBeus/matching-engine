@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,7 +12,71 @@ import (
 
 	"matching-engine/internal/account"
 	"matching-engine/internal/engine"
+	"matching-engine/internal/symbolspec"
 )
+
+func requiredQuoteAmount(t *testing.T, symbol, price, quantity string) int64 {
+	t.Helper()
+	spec, err := symbolspec.Get(symbol)
+	if err != nil {
+		t.Fatalf("spec not found: %v", err)
+	}
+	priceInt, err := symbolspec.ParseScaledInt(price, spec.PriceScale)
+	if err != nil {
+		t.Fatalf("parse price failed: %v", err)
+	}
+	qtyInt, err := symbolspec.ParseScaledInt(quantity, spec.QuantityScale)
+	if err != nil {
+		t.Fatalf("parse qty failed: %v", err)
+	}
+	denom, err := symbolspec.Pow10(spec.QuantityScale)
+	if err != nil {
+		t.Fatalf("pow10 failed: %v", err)
+	}
+	product := new(big.Int).Mul(big.NewInt(priceInt), big.NewInt(qtyInt))
+	q, r := new(big.Int), new(big.Int)
+	q.QuoRem(product, big.NewInt(denom), r)
+	if r.Sign() > 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	if !q.IsInt64() {
+		t.Fatalf("quote amount overflow")
+	}
+	return q.Int64()
+}
+
+type successEnvelope[T any] struct {
+	Code      string `json:"code"`
+	Data      T      `json:"data"`
+	RequestID string `json:"request_id"`
+}
+
+func decodeSuccess[T any](t *testing.T, buf *bytes.Buffer) T {
+	t.Helper()
+	var env successEnvelope[T]
+	if err := json.NewDecoder(buf).Decode(&env); err != nil {
+		t.Fatalf("decode success response failed: %v", err)
+	}
+	if env.Code != "OK" {
+		t.Fatalf("expected code OK, got %s", env.Code)
+	}
+	if env.RequestID == "" {
+		t.Fatalf("expected request_id to be set")
+	}
+	return env.Data
+}
+
+func decodeError(t *testing.T, buf *bytes.Buffer) ErrorResponse {
+	t.Helper()
+	var errResp ErrorResponse
+	if err := json.NewDecoder(buf).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response failed: %v", err)
+	}
+	if errResp.RequestID == "" {
+		t.Fatalf("expected request_id to be set")
+	}
+	return errResp
+}
 
 func TestPlaceOrder_Success(t *testing.T) {
 	// Setup
@@ -24,9 +89,10 @@ func TestPlaceOrder_Success(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
 
 	// Initialize account with USDT balance
-	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000, Frozen: 0})
+	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000, Frozen: 0})
 	if err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
@@ -56,10 +122,7 @@ func TestPlaceOrder_Success(t *testing.T) {
 		t.Logf("Response body: %s", w.Body.String())
 	}
 
-	var resp PlaceOrderResponse
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	resp := decodeSuccess[PlaceOrderResponse](t, w.Body)
 
 	if resp.OrderID == "" {
 		t.Error("Expected order_id to be set")
@@ -77,9 +140,90 @@ func TestPlaceOrder_Success(t *testing.T) {
 		t.Fatalf("GetBalance failed: %v", err)
 	}
 
-	expectedFrozen := int64(4300000) // 43000 * 100
+	expectedFrozen := required
 	if balance.Frozen != expectedFrozen {
 		t.Errorf("Expected frozen %d, got %d", expectedFrozen, balance.Frozen)
+	}
+}
+
+func TestPlaceOrder_Decimal_Success(t *testing.T) {
+	accountSvc := account.NewMemoryService()
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     1,
+		QueueSize:      100,
+		IdempotencyTTL: time.Minute,
+	})
+	defer eng.Close()
+
+	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000.123456", "0.5")
+	if err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000, Frozen: 0}); err != nil {
+		t.Fatalf("SetBalance failed: %v", err)
+	}
+
+	reqBody := PlaceOrderRequest{
+		ClientOrderID:  "client_order_decimal",
+		AccountID:      "acc1",
+		Symbol:         "BTC-USDT",
+		Side:           "BUY",
+		Price:          "43000.123456",
+		Quantity:       "0.5",
+		IdempotencyKey: "idem_key_decimal",
+	}
+
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	resp := decodeSuccess[PlaceOrderResponse](t, w.Body)
+	if resp.Price != "43000.123456" {
+		t.Fatalf("expected decimal price echo, got %s", resp.Price)
+	}
+	if resp.Quantity != "0.5" {
+		t.Fatalf("expected decimal quantity echo, got %s", resp.Quantity)
+	}
+}
+
+func TestPlaceOrder_DecimalTooPreciseRejected(t *testing.T) {
+	accountSvc := account.NewMemoryService()
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     1,
+		QueueSize:      100,
+		IdempotencyTTL: time.Minute,
+	})
+	defer eng.Close()
+
+	router := NewRouter(accountSvc, eng)
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 1_000_000_000_000, Frozen: 0})
+
+	reqBody := PlaceOrderRequest{
+		ClientOrderID:  "client_order_bad_decimal",
+		AccountID:      "acc1",
+		Symbol:         "BTC-USDT",
+		Side:           "BUY",
+		Price:          "43000.1234567",
+		Quantity:       "0.5",
+		IdempotencyKey: "idem_key_bad_decimal",
+	}
+
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d body=%s", w.Code, w.Body.String())
+	}
+	errResp := decodeError(t, w.Body)
+	if errResp.Code != string(ErrorCodeInvalidArgument) {
+		t.Fatalf("expected INVALID_ARGUMENT, got %s", errResp.Code)
 	}
 }
 
@@ -94,9 +238,10 @@ func TestPlaceOrder_InsufficientBalance(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
 
 	// Initialize account with insufficient USDT balance
-	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 1000000, Frozen: 0})
+	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required - 1, Frozen: 0})
 	if err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
@@ -121,14 +266,11 @@ func TestPlaceOrder_InsufficientBalance(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	// Assert
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("Expected status 400, got %d", w.Code)
+	if w.Code != http.StatusConflict {
+		t.Errorf("Expected status 409, got %d", w.Code)
 	}
 
-	var errResp ErrorResponse
-	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
-		t.Fatalf("Failed to decode error response: %v", err)
-	}
+	errResp := decodeError(t, w.Body)
 
 	if errResp.Code != string(ErrorCodeInsufficientBalance) {
 		t.Errorf("Expected error code '%s', got '%s'", ErrorCodeInsufficientBalance, errResp.Code)
@@ -143,8 +285,8 @@ func TestPlaceOrder_InsufficientBalance(t *testing.T) {
 	if balance.Frozen != 0 {
 		t.Errorf("Expected frozen 0, got %d", balance.Frozen)
 	}
-	if balance.Available != 1000000 {
-		t.Errorf("Expected available 1000000, got %d", balance.Available)
+	if balance.Available != required-1 {
+		t.Errorf("Expected available %d, got %d", required-1, balance.Available)
 	}
 }
 
@@ -217,10 +359,7 @@ func TestPlaceOrder_InvalidRequest(t *testing.T) {
 				t.Errorf("Expected status 400, got %d", w.Code)
 			}
 
-			var errResp ErrorResponse
-			if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
-				t.Fatalf("Failed to decode error response: %v", err)
-			}
+			errResp := decodeError(t, w.Body)
 
 			if errResp.Code != string(ErrorCodeInvalidArgument) {
 				t.Errorf("Expected error code '%s', got '%s'", ErrorCodeInvalidArgument, errResp.Code)
@@ -240,9 +379,10 @@ func TestCancelOrder_Success(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
 
 	// Initialize account with USDT balance
-	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000, Frozen: 0})
+	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000, Frozen: 0})
 	if err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
@@ -265,17 +405,14 @@ func TestCancelOrder_Success(t *testing.T) {
 
 	router.ServeHTTP(placeW, placeReq)
 
-	var placeResp PlaceOrderResponse
-	if err := json.NewDecoder(placeW.Body).Decode(&placeResp); err != nil {
-		t.Fatalf("Failed to decode place response: %v", err)
-	}
+	placeResp := decodeSuccess[PlaceOrderResponse](t, placeW.Body)
 
 	orderID := placeResp.OrderID
 
 	// Verify balance frozen
 	balanceAfterPlace, _ := accountSvc.GetBalance("acc1", "USDT")
-	if balanceAfterPlace.Frozen != 4300000 {
-		t.Errorf("Expected frozen 4300000 after place, got %d", balanceAfterPlace.Frozen)
+	if balanceAfterPlace.Frozen != required {
+		t.Errorf("Expected frozen %d after place, got %d", required, balanceAfterPlace.Frozen)
 	}
 
 	// Now cancel the order
@@ -294,10 +431,7 @@ func TestCancelOrder_Success(t *testing.T) {
 		t.Logf("Response body: %s", cancelW.Body.String())
 	}
 
-	var cancelResp CancelOrderResponse
-	if err := json.NewDecoder(cancelW.Body).Decode(&cancelResp); err != nil {
-		t.Fatalf("Failed to decode cancel response: %v", err)
-	}
+	cancelResp := decodeSuccess[CancelOrderResponse](t, cancelW.Body)
 
 	if cancelResp.Status != "CANCELED" {
 		t.Errorf("Expected status 'CANCELED', got '%s'", cancelResp.Status)
@@ -312,8 +446,8 @@ func TestCancelOrder_Success(t *testing.T) {
 	if balanceAfterCancel.Frozen != 0 {
 		t.Errorf("Expected frozen 0 after cancel, got %d", balanceAfterCancel.Frozen)
 	}
-	if balanceAfterCancel.Available != 10000000 {
-		t.Errorf("Expected available 10000000 after cancel, got %d", balanceAfterCancel.Available)
+	if balanceAfterCancel.Available != required+1_000_000 {
+		t.Errorf("Expected available %d after cancel, got %d", required+1_000_000, balanceAfterCancel.Available)
 	}
 }
 
@@ -344,10 +478,7 @@ func TestCancelOrder_NotFound(t *testing.T) {
 		t.Errorf("Expected status 404, got %d", cancelW.Code)
 	}
 
-	var errResp ErrorResponse
-	if err := json.NewDecoder(cancelW.Body).Decode(&errResp); err != nil {
-		t.Fatalf("Failed to decode error response: %v", err)
-	}
+	errResp := decodeError(t, cancelW.Body)
 
 	if errResp.Code != string(ErrorCodeOrderNotFound) {
 		t.Errorf("Expected error code '%s', got '%s'", ErrorCodeOrderNotFound, errResp.Code)
@@ -365,9 +496,10 @@ func TestQueryOrder_Success(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
 
 	// Initialize account with USDT balance
-	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000, Frozen: 0})
+	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000, Frozen: 0})
 	if err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
@@ -390,10 +522,7 @@ func TestQueryOrder_Success(t *testing.T) {
 
 	router.ServeHTTP(placeW, placeReq)
 
-	var placeResp PlaceOrderResponse
-	if err := json.NewDecoder(placeW.Body).Decode(&placeResp); err != nil {
-		t.Fatalf("Failed to decode place response: %v", err)
-	}
+	placeResp := decodeSuccess[PlaceOrderResponse](t, placeW.Body)
 
 	orderID := placeResp.OrderID
 
@@ -413,10 +542,7 @@ func TestQueryOrder_Success(t *testing.T) {
 		t.Logf("Response body: %s", queryW.Body.String())
 	}
 
-	var queryResp QueryOrderResponse
-	if err := json.NewDecoder(queryW.Body).Decode(&queryResp); err != nil {
-		t.Fatalf("Failed to decode query response: %v", err)
-	}
+	queryResp := decodeSuccess[QueryOrderResponse](t, queryW.Body)
 
 	if queryResp.OrderID != orderID {
 		t.Errorf("Expected order_id '%s', got '%s'", orderID, queryResp.OrderID)
@@ -462,10 +588,7 @@ func TestQueryOrder_NotFound(t *testing.T) {
 		t.Errorf("Expected status 404, got %d", queryW.Code)
 	}
 
-	var errResp ErrorResponse
-	if err := json.NewDecoder(queryW.Body).Decode(&errResp); err != nil {
-		t.Fatalf("Failed to decode error response: %v", err)
-	}
+	errResp := decodeError(t, queryW.Body)
 
 	if errResp.Code != string(ErrorCodeOrderNotFound) {
 		t.Errorf("Expected error code '%s', got '%s'", ErrorCodeOrderNotFound, errResp.Code)
@@ -483,9 +606,10 @@ func TestIdempotency(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
 
 	// Initialize account with USDT balance
-	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000, Frozen: 0})
+	err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000, Frozen: 0})
 	if err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
@@ -513,10 +637,7 @@ func TestIdempotency(t *testing.T) {
 		t.Fatalf("First request failed with status %d", w1.Code)
 	}
 
-	var resp1 PlaceOrderResponse
-	if err := json.NewDecoder(w1.Body).Decode(&resp1); err != nil {
-		t.Fatalf("Failed to decode first response: %v", err)
-	}
+	resp1 := decodeSuccess[PlaceOrderResponse](t, w1.Body)
 
 	// Second request with same idempotency key
 	body2, _ := json.Marshal(reqBody)
@@ -530,10 +651,7 @@ func TestIdempotency(t *testing.T) {
 		t.Fatalf("Second request failed with status %d", w2.Code)
 	}
 
-	var resp2 PlaceOrderResponse
-	if err := json.NewDecoder(w2.Body).Decode(&resp2); err != nil {
-		t.Fatalf("Failed to decode second response: %v", err)
-	}
+	resp2 := decodeSuccess[PlaceOrderResponse](t, w2.Body)
 
 	// Both responses should have the same order_id (idempotency)
 	if resp1.OrderID != resp2.OrderID {
@@ -546,9 +664,64 @@ func TestIdempotency(t *testing.T) {
 		t.Fatalf("GetBalance failed: %v", err)
 	}
 
-	expectedFrozen := int64(4300000) // Should only be frozen once
+	expectedFrozen := required // Should only be frozen once
 	if balance.Frozen != expectedFrozen {
 		t.Errorf("Expected frozen %d (only once), got %d", expectedFrozen, balance.Frozen)
+	}
+}
+
+func TestIdempotency_DifferentPayloadReturnsDuplicateRequest(t *testing.T) {
+	accountSvc := account.NewMemoryService()
+	eng := engine.NewEngine(&engine.EngineConfig{
+		ShardCount:     1,
+		QueueSize:      100,
+		IdempotencyTTL: time.Minute,
+	})
+	defer eng.Close()
+
+	router := NewRouter(accountSvc, eng)
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "101")
+	if err := accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000, Frozen: 0}); err != nil {
+		t.Fatalf("SetBalance failed: %v", err)
+	}
+
+	firstBody, _ := json.Marshal(PlaceOrderRequest{
+		ClientOrderID:  "client_order_1",
+		AccountID:      "acc1",
+		Symbol:         "BTC-USDT",
+		Side:           "BUY",
+		Price:          "43000",
+		Quantity:       "100",
+		IdempotencyKey: "idem_same_key",
+	})
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(firstBody))
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstW := httptest.NewRecorder()
+	router.ServeHTTP(firstW, firstReq)
+	if firstW.Code != http.StatusOK {
+		t.Fatalf("first request failed: %d body=%s", firstW.Code, firstW.Body.String())
+	}
+
+	secondBody, _ := json.Marshal(PlaceOrderRequest{
+		ClientOrderID:  "client_order_1",
+		AccountID:      "acc1",
+		Symbol:         "BTC-USDT",
+		Side:           "BUY",
+		Price:          "43000",
+		Quantity:       "101",
+		IdempotencyKey: "idem_same_key",
+	})
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/orders", bytes.NewReader(secondBody))
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondW := httptest.NewRecorder()
+	router.ServeHTTP(secondW, secondReq)
+
+	if secondW.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for idempotency conflict, got %d body=%s", secondW.Code, secondW.Body.String())
+	}
+	errResp := decodeError(t, secondW.Body)
+	if errResp.Code != string(ErrorCodeDuplicateRequest) {
+		t.Fatalf("expected DUPLICATE_REQUEST, got %s", errResp.Code)
 	}
 }
 
@@ -562,8 +735,9 @@ func TestIdempotencyKeyScopedByAccountAndSymbolForOrderID(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
-	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000})
-	_ = accountSvc.SetBalance("acc2", "USDT", account.Balance{Available: 10000000})
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000})
+	_ = accountSvc.SetBalance("acc2", "USDT", account.Balance{Available: required + 1_000_000})
 
 	makeReq := func(accountID string) PlaceOrderResponse {
 		body, _ := json.Marshal(PlaceOrderRequest{
@@ -582,10 +756,7 @@ func TestIdempotencyKeyScopedByAccountAndSymbolForOrderID(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200 for %s, got %d body=%s", accountID, w.Code, w.Body.String())
 		}
-		var resp PlaceOrderResponse
-		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-			t.Fatalf("decode response failed: %v", err)
-		}
+		resp := decodeSuccess[PlaceOrderResponse](t, w.Body)
 		return resp
 	}
 
@@ -606,7 +777,8 @@ func TestPlaceOrder_InvalidSymbolMappedToInvalidArgument(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
-	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000})
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000})
 
 	body, _ := json.Marshal(PlaceOrderRequest{
 		ClientOrderID:  "client1",
@@ -626,10 +798,7 @@ func TestPlaceOrder_InvalidSymbolMappedToInvalidArgument(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
 	}
-	var errResp ErrorResponse
-	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
-		t.Fatalf("decode error response failed: %v", err)
-	}
+	errResp := decodeError(t, w.Body)
 	if errResp.Code != string(ErrorCodeInvalidArgument) {
 		t.Fatalf("expected INVALID_ARGUMENT, got %s", errResp.Code)
 	}
@@ -645,7 +814,8 @@ func TestQueryClosedOrderAfterCancel(t *testing.T) {
 	defer eng.Close()
 
 	router := NewRouter(accountSvc, eng)
-	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: 10000000})
+	required := requiredQuoteAmount(t, "BTC-USDT", "43000", "100")
+	_ = accountSvc.SetBalance("acc1", "USDT", account.Balance{Available: required + 1_000_000})
 
 	placeBody, _ := json.Marshal(PlaceOrderRequest{
 		ClientOrderID:  "client_order_closed",
@@ -663,10 +833,7 @@ func TestQueryClosedOrderAfterCancel(t *testing.T) {
 	if placeW.Code != http.StatusOK {
 		t.Fatalf("place failed: %d %s", placeW.Code, placeW.Body.String())
 	}
-	var placeResp PlaceOrderResponse
-	if err := json.NewDecoder(placeW.Body).Decode(&placeResp); err != nil {
-		t.Fatalf("decode place response failed: %v", err)
-	}
+	placeResp := decodeSuccess[PlaceOrderResponse](t, placeW.Body)
 
 	cancelReq := httptest.NewRequest(
 		http.MethodDelete,
@@ -690,10 +857,7 @@ func TestQueryClosedOrderAfterCancel(t *testing.T) {
 		t.Fatalf("query closed order failed: %d %s", queryW.Code, queryW.Body.String())
 	}
 
-	var queryResp QueryOrderResponse
-	if err := json.NewDecoder(queryW.Body).Decode(&queryResp); err != nil {
-		t.Fatalf("decode query response failed: %v", err)
-	}
+	queryResp := decodeSuccess[QueryOrderResponse](t, queryW.Body)
 	if queryResp.Status != "CANCELED" {
 		t.Fatalf("expected CANCELED, got %s", queryResp.Status)
 	}

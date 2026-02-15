@@ -4,201 +4,196 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"matching-engine/internal/symbolspec"
 )
+
+func mustSpec(t *testing.T, symbol string) symbolspec.Spec {
+	t.Helper()
+	spec, err := symbolspec.Get(symbol)
+	if err != nil {
+		t.Fatalf("symbol spec not found: %v", err)
+	}
+	return spec
+}
+
+func mustPriceInt(t *testing.T, symbol, v string) int64 {
+	t.Helper()
+	spec := mustSpec(t, symbol)
+	n, err := symbolspec.ParseScaledInt(v, spec.PriceScale)
+	if err != nil {
+		t.Fatalf("parse price failed: %v", err)
+	}
+	return n
+}
+
+func mustQtyInt(t *testing.T, symbol, v string) int64 {
+	t.Helper()
+	spec := mustSpec(t, symbol)
+	n, err := symbolspec.ParseScaledInt(v, spec.QuantityScale)
+	if err != nil {
+		t.Fatalf("parse quantity failed: %v", err)
+	}
+	return n
+}
+
+func mustQuoteAmount(t *testing.T, symbol string, priceInt, qtyInt int64) int64 {
+	t.Helper()
+	spec := mustSpec(t, symbol)
+	n, err := quoteAmountFromTrade(priceInt, qtyInt, spec.QuantityScale)
+	if err != nil {
+		t.Fatalf("quote amount failed: %v", err)
+	}
+	return n
+}
 
 func TestCheckAndFreezeForPlace_BUY(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	priceInt := mustPriceInt(t, symbol, "43000.25")
+	qtyInt := mustQtyInt(t, symbol, "100.5")
+	freezeAmount := mustQuoteAmount(t, symbol, priceInt, qtyInt)
+	initialAvail := freezeAmount + 1_000_000
 
-	// Initialize account with USDT balance
-	err := svc.SetBalance("acc1", "USDT", Balance{Available: 10000000, Frozen: 0})
-	if err != nil {
+	if err := svc.SetBalance("acc1", "USDT", Balance{Available: initialAvail, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
 
-	// Place BUY order: BTC-USDT at price 43000, quantity 100
-	intent := PlaceIntent{
+	err := svc.CheckAndFreezeForPlace(PlaceIntent{
 		AccountID: "acc1",
 		OrderID:   "order1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 		Side:      "BUY",
-		PriceInt:  43000,
-		QtyInt:    100,
-	}
-
-	err = svc.CheckAndFreezeForPlace(intent)
+		PriceInt:  priceInt,
+		QtyInt:    qtyInt,
+	})
 	if err != nil {
 		t.Fatalf("CheckAndFreezeForPlace failed: %v", err)
 	}
 
-	// Verify USDT balance: should freeze 43000 * 100 = 4,300,000
 	balance, err := svc.GetBalance("acc1", "USDT")
 	if err != nil {
 		t.Fatalf("GetBalance failed: %v", err)
 	}
-
-	expectedFrozen := int64(4300000)
-	expectedAvailable := int64(10000000 - 4300000)
-
-	if balance.Frozen != expectedFrozen {
-		t.Errorf("Expected frozen %d, got %d", expectedFrozen, balance.Frozen)
+	if balance.Frozen != freezeAmount {
+		t.Errorf("Expected frozen %d, got %d", freezeAmount, balance.Frozen)
 	}
-	if balance.Available != expectedAvailable {
-		t.Errorf("Expected available %d, got %d", expectedAvailable, balance.Available)
+	if balance.Available != initialAvail-freezeAmount {
+		t.Errorf("Expected available %d, got %d", initialAvail-freezeAmount, balance.Available)
 	}
 }
 
 func TestCheckAndFreezeForPlace_SELL(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	qtyInt := mustQtyInt(t, symbol, "12.345678")
+	initialAvail := qtyInt + 1
 
-	// Initialize account with BTC balance
-	err := svc.SetBalance("acc1", "BTC", Balance{Available: 1000, Frozen: 0})
-	if err != nil {
+	if err := svc.SetBalance("acc1", "BTC", Balance{Available: initialAvail, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
 
-	// Place SELL order: BTC-USDT, quantity 100
-	intent := PlaceIntent{
+	err := svc.CheckAndFreezeForPlace(PlaceIntent{
 		AccountID: "acc1",
 		OrderID:   "order1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 		Side:      "SELL",
-		PriceInt:  43000,
-		QtyInt:    100,
-	}
-
-	err = svc.CheckAndFreezeForPlace(intent)
+		PriceInt:  mustPriceInt(t, symbol, "43000.123"),
+		QtyInt:    qtyInt,
+	})
 	if err != nil {
 		t.Fatalf("CheckAndFreezeForPlace failed: %v", err)
 	}
 
-	// Verify BTC balance: should freeze 100
 	balance, err := svc.GetBalance("acc1", "BTC")
 	if err != nil {
 		t.Fatalf("GetBalance failed: %v", err)
 	}
-
-	expectedFrozen := int64(100)
-	expectedAvailable := int64(900)
-
-	if balance.Frozen != expectedFrozen {
-		t.Errorf("Expected frozen %d, got %d", expectedFrozen, balance.Frozen)
+	if balance.Frozen != qtyInt {
+		t.Errorf("Expected frozen %d, got %d", qtyInt, balance.Frozen)
 	}
-	if balance.Available != expectedAvailable {
-		t.Errorf("Expected available %d, got %d", expectedAvailable, balance.Available)
+	if balance.Available != 1 {
+		t.Errorf("Expected available 1, got %d", balance.Available)
 	}
 }
 
 func TestCheckAndFreezeForPlace_InsufficientBalance(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	priceInt := mustPriceInt(t, symbol, "43000")
+	qtyInt := mustQtyInt(t, symbol, "100")
+	freezeAmount := mustQuoteAmount(t, symbol, priceInt, qtyInt)
 
-	// Initialize account with insufficient USDT balance
-	err := svc.SetBalance("acc1", "USDT", Balance{Available: 1000000, Frozen: 0})
-	if err != nil {
+	if err := svc.SetBalance("acc1", "USDT", Balance{Available: freezeAmount - 1, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
 
-	// Try to place BUY order that requires more than available
-	intent := PlaceIntent{
+	err := svc.CheckAndFreezeForPlace(PlaceIntent{
 		AccountID: "acc1",
 		OrderID:   "order1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 		Side:      "BUY",
-		PriceInt:  43000,
-		QtyInt:    100, // Requires 4,300,000 but only have 1,000,000
-	}
-
-	err = svc.CheckAndFreezeForPlace(intent)
+		PriceInt:  priceInt,
+		QtyInt:    qtyInt,
+	})
 	if err == nil {
 		t.Fatalf("Expected insufficient balance error, got nil")
 	}
 
-	// Verify it's an InsufficientBalanceError
 	var insufficientErr *InsufficientBalanceError
 	if !errors.As(err, &insufficientErr) {
 		t.Errorf("Expected InsufficientBalanceError, got: %v", err)
-	}
-
-	// Verify balance unchanged
-	balance, err := svc.GetBalance("acc1", "USDT")
-	if err != nil {
-		t.Fatalf("GetBalance failed: %v", err)
-	}
-
-	if balance.Frozen != 0 {
-		t.Errorf("Expected frozen 0, got %d", balance.Frozen)
-	}
-	if balance.Available != 1000000 {
-		t.Errorf("Expected available 1000000, got %d", balance.Available)
 	}
 }
 
 func TestReleaseOnCancel(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	priceInt := mustPriceInt(t, symbol, "42000.5")
+	qtyInt := mustQtyInt(t, symbol, "2.5")
+	freezeAmount := mustQuoteAmount(t, symbol, priceInt, qtyInt)
+	initialAvail := freezeAmount + 10_000
 
-	// Initialize account with USDT balance
-	err := svc.SetBalance("acc1", "USDT", Balance{Available: 10000000, Frozen: 0})
-	if err != nil {
+	if err := svc.SetBalance("acc1", "USDT", Balance{Available: initialAvail, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
-
-	// Place BUY order
-	placeIntent := PlaceIntent{
+	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
 		AccountID: "acc1",
 		OrderID:   "order1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 		Side:      "BUY",
-		PriceInt:  43000,
-		QtyInt:    100,
+		PriceInt:  priceInt,
+		QtyInt:    qtyInt,
+	}); err != nil {
+		t.Fatalf("freeze failed: %v", err)
 	}
-
-	err = svc.CheckAndFreezeForPlace(placeIntent)
-	if err != nil {
-		t.Fatalf("CheckAndFreezeForPlace failed: %v", err)
-	}
-
-	// Verify funds are frozen
-	balanceAfterPlace, _ := svc.GetBalance("acc1", "USDT")
-	if balanceAfterPlace.Frozen != 4300000 {
-		t.Errorf("Expected frozen 4300000, got %d", balanceAfterPlace.Frozen)
-	}
-
-	// Cancel the order
-	cancelIntent := CancelIntent{
+	if err := svc.ReleaseOnCancel(CancelIntent{
 		AccountID: "acc1",
 		OrderID:   "order1",
-		Symbol:    "BTC-USDT",
-	}
-
-	err = svc.ReleaseOnCancel(cancelIntent)
-	if err != nil {
+		Symbol:    symbol,
+	}); err != nil {
 		t.Fatalf("ReleaseOnCancel failed: %v", err)
 	}
 
-	// Verify funds are unfrozen
-	balanceAfterCancel, err := svc.GetBalance("acc1", "USDT")
+	balance, err := svc.GetBalance("acc1", "USDT")
 	if err != nil {
 		t.Fatalf("GetBalance failed: %v", err)
 	}
-
-	if balanceAfterCancel.Frozen != 0 {
-		t.Errorf("Expected frozen 0 after cancel, got %d", balanceAfterCancel.Frozen)
+	if balance.Frozen != 0 {
+		t.Errorf("Expected frozen 0 after cancel, got %d", balance.Frozen)
 	}
-	if balanceAfterCancel.Available != 10000000 {
-		t.Errorf("Expected available 10000000 after cancel, got %d", balanceAfterCancel.Available)
+	if balance.Available != initialAvail {
+		t.Errorf("Expected available %d after cancel, got %d", initialAvail, balance.Available)
 	}
 }
 
 func TestReleaseOnCancel_OrderNotFound(t *testing.T) {
 	svc := NewMemoryService()
-
-	// Try to cancel non-existent order - should not error
-	cancelIntent := CancelIntent{
+	err := svc.ReleaseOnCancel(CancelIntent{
 		AccountID: "acc1",
 		OrderID:   "nonexistent",
 		Symbol:    "BTC-USDT",
-	}
-
-	err := svc.ReleaseOnCancel(cancelIntent)
+	})
 	if err != nil {
 		t.Errorf("ReleaseOnCancel should not error for non-existent order, got: %v", err)
 	}
@@ -206,67 +201,57 @@ func TestReleaseOnCancel_OrderNotFound(t *testing.T) {
 
 func TestConcurrentFreezeAndRelease(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	priceInt := mustPriceInt(t, symbol, "43000")
+	qtyInt := mustQtyInt(t, symbol, "0.1")
+	singleFreeze := mustQuoteAmount(t, symbol, priceInt, qtyInt)
 
-	// Initialize account with large balance
-	err := svc.SetBalance("acc1", "USDT", Balance{Available: 100000000, Frozen: 0})
-	if err != nil {
+	const numOps = 100
+	initial := singleFreeze * numOps * 2
+	if err := svc.SetBalance("acc1", "USDT", Balance{Available: initial, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance failed: %v", err)
 	}
 
-	// Concurrently freeze and release funds
-	const numOps = 100
 	done := make(chan bool, numOps*2)
-
-	// Freeze operations
 	for i := 0; i < numOps; i++ {
 		go func(idx int) {
-			intent := PlaceIntent{
+			_ = svc.CheckAndFreezeForPlace(PlaceIntent{
 				AccountID: "acc1",
 				OrderID:   fmt.Sprintf("order%d", idx),
-				Symbol:    "BTC-USDT",
+				Symbol:    symbol,
 				Side:      "BUY",
-				PriceInt:  43000,
-				QtyInt:    10,
-			}
-			_ = svc.CheckAndFreezeForPlace(intent)
+				PriceInt:  priceInt,
+				QtyInt:    qtyInt,
+			})
 			done <- true
 		}(i)
 	}
-
-	// Release operations
 	for i := 0; i < numOps; i++ {
 		go func(idx int) {
-			intent := CancelIntent{
+			_ = svc.ReleaseOnCancel(CancelIntent{
 				AccountID: "acc1",
 				OrderID:   fmt.Sprintf("order%d", idx),
-				Symbol:    "BTC-USDT",
-			}
-			_ = svc.ReleaseOnCancel(intent)
+				Symbol:    symbol,
+			})
 			done <- true
 		}(i)
 	}
-
-	// Wait for all operations
 	for i := 0; i < numOps*2; i++ {
 		<-done
 	}
 
-	// Verify no negative balance
 	balance, err := svc.GetBalance("acc1", "USDT")
 	if err != nil {
 		t.Fatalf("GetBalance failed: %v", err)
 	}
-
 	if balance.Available < 0 {
 		t.Errorf("Negative available balance: %d", balance.Available)
 	}
 	if balance.Frozen < 0 {
 		t.Errorf("Negative frozen balance: %d", balance.Frozen)
 	}
-
-	total := balance.Available + balance.Frozen
-	if total != 100000000 {
-		t.Errorf("Total balance changed: expected 100000000, got %d", total)
+	if balance.Available+balance.Frozen != initial {
+		t.Errorf("Total balance changed: expected %d, got %d", initial, balance.Available+balance.Frozen)
 	}
 }
 
@@ -307,57 +292,58 @@ func TestParseSymbol(t *testing.T) {
 
 func TestApplyTradeAndReleaseRemainingOnCancel(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	priceInt := mustPriceInt(t, symbol, "100")
+	totalQty := mustQtyInt(t, symbol, "10")
+	filledQty := mustQtyInt(t, symbol, "4")
+	totalQuote := mustQuoteAmount(t, symbol, priceInt, totalQty)
+	filledQuote := mustQuoteAmount(t, symbol, priceInt, filledQty)
 
-	if err := svc.SetBalance("buyer", "USDT", Balance{Available: 10000, Frozen: 0}); err != nil {
+	if err := svc.SetBalance("buyer", "USDT", Balance{Available: totalQuote + 5000, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance buyer USDT failed: %v", err)
 	}
-	if err := svc.SetBalance("seller", "BTC", Balance{Available: 10, Frozen: 0}); err != nil {
+	if err := svc.SetBalance("seller", "BTC", Balance{Available: totalQty + 10, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance seller BTC failed: %v", err)
 	}
 
-	// buyer freezes 100 * 10 = 1000 USDT
 	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
 		AccountID: "buyer",
 		OrderID:   "buy-order-1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 		Side:      "BUY",
-		PriceInt:  100,
-		QtyInt:    10,
+		PriceInt:  priceInt,
+		QtyInt:    totalQty,
 	}); err != nil {
 		t.Fatalf("freeze buyer failed: %v", err)
 	}
-
-	// seller freezes 10 BTC
 	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
 		AccountID: "seller",
 		OrderID:   "sell-order-1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 		Side:      "SELL",
-		PriceInt:  100,
-		QtyInt:    10,
+		PriceInt:  priceInt,
+		QtyInt:    totalQty,
 	}); err != nil {
 		t.Fatalf("freeze seller failed: %v", err)
 	}
 
-	// Match 4 units at price 100.
 	if err := svc.ApplyTrade(TradeIntent{
 		TradeID:         "trd_1",
 		BuyerAccountID:  "buyer",
 		SellerAccountID: "seller",
 		BuyerOrderID:    "buy-order-1",
 		SellerOrderID:   "sell-order-1",
-		Symbol:          "BTC-USDT",
-		PriceInt:        100,
-		QuantityInt:     4,
+		Symbol:          symbol,
+		PriceInt:        priceInt,
+		QuantityInt:     filledQty,
 	}); err != nil {
 		t.Fatalf("ApplyTrade failed: %v", err)
 	}
 
-	// Buyer cancel should release only remaining frozen amount (600), not full 1000.
 	if err := svc.ReleaseOnCancel(CancelIntent{
 		AccountID: "buyer",
 		OrderID:   "buy-order-1",
-		Symbol:    "BTC-USDT",
+		Symbol:    symbol,
 	}); err != nil {
 		t.Fatalf("ReleaseOnCancel failed: %v", err)
 	}
@@ -366,34 +352,39 @@ func TestApplyTradeAndReleaseRemainingOnCancel(t *testing.T) {
 	if buyerUSDT.Frozen != 0 {
 		t.Fatalf("expected buyer frozen quote 0, got %d", buyerUSDT.Frozen)
 	}
-	// Initial 10000 - executed quote 400 = 9600
-	if buyerUSDT.Available != 9600 {
-		t.Fatalf("expected buyer available quote 9600, got %d", buyerUSDT.Available)
+	wantBuyerQuoteAvail := (totalQuote + 5000) - filledQuote
+	if buyerUSDT.Available != wantBuyerQuoteAvail {
+		t.Fatalf("expected buyer available quote %d, got %d", wantBuyerQuoteAvail, buyerUSDT.Available)
 	}
 
 	buyerBTC, _ := svc.GetBalance("buyer", "BTC")
-	if buyerBTC.Available != 4 {
-		t.Fatalf("expected buyer base received 4, got %d", buyerBTC.Available)
+	if buyerBTC.Available != filledQty {
+		t.Fatalf("expected buyer base received %d, got %d", filledQty, buyerBTC.Available)
 	}
 }
 
 func TestApplyTradeIsIdempotentByTradeID(t *testing.T) {
 	svc := NewMemoryService()
+	symbol := "BTC-USDT"
+	priceInt := mustPriceInt(t, symbol, "100")
+	qtyInt := mustQtyInt(t, symbol, "5")
+	filledQty := mustQtyInt(t, symbol, "1")
+	totalQuote := mustQuoteAmount(t, symbol, priceInt, qtyInt)
 
-	if err := svc.SetBalance("buyer", "USDT", Balance{Available: 1000, Frozen: 0}); err != nil {
+	if err := svc.SetBalance("buyer", "USDT", Balance{Available: totalQuote + 1000, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance buyer USDT failed: %v", err)
 	}
-	if err := svc.SetBalance("seller", "BTC", Balance{Available: 5, Frozen: 0}); err != nil {
+	if err := svc.SetBalance("seller", "BTC", Balance{Available: qtyInt + 5, Frozen: 0}); err != nil {
 		t.Fatalf("SetBalance seller BTC failed: %v", err)
 	}
 
 	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
-		AccountID: "buyer", OrderID: "b1", Symbol: "BTC-USDT", Side: "BUY", PriceInt: 100, QtyInt: 5,
+		AccountID: "buyer", OrderID: "b1", Symbol: symbol, Side: "BUY", PriceInt: priceInt, QtyInt: qtyInt,
 	}); err != nil {
 		t.Fatalf("freeze buyer failed: %v", err)
 	}
 	if err := svc.CheckAndFreezeForPlace(PlaceIntent{
-		AccountID: "seller", OrderID: "s1", Symbol: "BTC-USDT", Side: "SELL", PriceInt: 100, QtyInt: 5,
+		AccountID: "seller", OrderID: "s1", Symbol: symbol, Side: "SELL", PriceInt: priceInt, QtyInt: qtyInt,
 	}); err != nil {
 		t.Fatalf("freeze seller failed: %v", err)
 	}
@@ -404,9 +395,9 @@ func TestApplyTradeIsIdempotentByTradeID(t *testing.T) {
 		SellerAccountID: "seller",
 		BuyerOrderID:    "b1",
 		SellerOrderID:   "s1",
-		Symbol:          "BTC-USDT",
-		PriceInt:        100,
-		QuantityInt:     1,
+		Symbol:          symbol,
+		PriceInt:        priceInt,
+		QuantityInt:     filledQty,
 	}
 	if err := svc.ApplyTrade(trade); err != nil {
 		t.Fatalf("first ApplyTrade failed: %v", err)
@@ -416,7 +407,8 @@ func TestApplyTradeIsIdempotentByTradeID(t *testing.T) {
 	}
 
 	buyerUSDT, _ := svc.GetBalance("buyer", "USDT")
-	if buyerUSDT.Available != 500 {
-		t.Fatalf("expected buyer available quote 500, got %d", buyerUSDT.Available)
+	want := int64(1000)
+	if buyerUSDT.Available != want {
+		t.Fatalf("expected buyer available quote %d, got %d", want, buyerUSDT.Available)
 	}
 }
