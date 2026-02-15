@@ -57,6 +57,7 @@ func TestIdempotency(t *testing.T) {
 		QueueSize:      100,
 		IdempotencyTTL: 1 * time.Hour,
 	})
+	defer engine.Close()
 
 	// Test 1: Same idempotency key + same payload = only execute once
 	req1 := &matching.PlaceOrderRequest{
@@ -160,6 +161,7 @@ func TestConcurrencyIsolation(t *testing.T) {
 		QueueSize:      100,
 		IdempotencyTTL: 1 * time.Hour,
 	})
+	defer engine.Close()
 
 	symbols := []string{"BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT"}
 	var wg sync.WaitGroup
@@ -245,6 +247,7 @@ func TestIdempotencyScope(t *testing.T) {
 		QueueSize:      100,
 		IdempotencyTTL: 1 * time.Hour,
 	})
+	defer engine.Close()
 
 	// Same idempotency key but different account should be allowed
 	req1 := &matching.PlaceOrderRequest{
@@ -306,7 +309,7 @@ func TestIdempotencyScope(t *testing.T) {
 	req3 := &matching.PlaceOrderRequest{
 		OrderID:       "order3",
 		ClientOrderID: "client3",
-		AccountID:     "acc1", // Same account as first
+		AccountID:     "acc1",     // Same account as first
 		Symbol:        "ETH-USDT", // Different symbol
 		Side:          matching.SideBuy,
 		PriceInt:      2000,
@@ -334,6 +337,7 @@ func TestIdempotencyScope(t *testing.T) {
 // TestCancelOrder tests cancel order functionality through engine
 func TestCancelOrder(t *testing.T) {
 	engine := NewEngine(DefaultEngineConfig())
+	defer engine.Close()
 
 	// Place an order
 	placeReq := &matching.PlaceOrderRequest{
@@ -411,6 +415,7 @@ func TestCancelOrder(t *testing.T) {
 // TestMatchingAcrossEngine tests that matching works correctly through the engine
 func TestMatchingAcrossEngine(t *testing.T) {
 	engine := NewEngine(DefaultEngineConfig())
+	defer engine.Close()
 
 	// Place buy order
 	buyReq := &matching.PlaceOrderRequest{
@@ -483,5 +488,205 @@ func TestMatchingAcrossEngine(t *testing.T) {
 	}
 	if sellResult.Result.Trades[0].TakerOrderID != "sell1" {
 		t.Errorf("Expected taker order sell1, got %s", sellResult.Result.Trades[0].TakerOrderID)
+	}
+}
+
+func TestSubmitNilEnvelope(t *testing.T) {
+	engine := NewEngine(DefaultEngineConfig())
+	defer engine.Close()
+
+	result := engine.Submit(nil)
+	if result == nil {
+		t.Fatalf("expected non-nil result")
+	}
+	if result.ErrorCode != ErrorCodeInvalidArgument {
+		t.Fatalf("expected INVALID_ARGUMENT, got %s", result.ErrorCode)
+	}
+}
+
+func TestEngineClose(t *testing.T) {
+	engine := NewEngine(DefaultEngineConfig())
+	engine.Close()
+	engine.Close()
+
+	req := &matching.PlaceOrderRequest{
+		OrderID:       "order_close_1",
+		ClientOrderID: "client_close_1",
+		AccountID:     "acc1",
+		Symbol:        "BTC-USDT",
+		Side:          matching.SideBuy,
+		PriceInt:      43000,
+		QuantityInt:   100,
+	}
+	hash, _ := ComputePayloadHash(req)
+	envelope := &CommandEnvelope{
+		CommandID:      "cmd_close_1",
+		CommandType:    CommandTypePlace,
+		IdempotencyKey: "idem_close_1",
+		Symbol:         "BTC-USDT",
+		AccountID:      "acc1",
+		PayloadHash:    hash,
+		Payload:        req,
+		CreatedAt:      time.Now(),
+	}
+
+	result := engine.Submit(envelope)
+	if result == nil {
+		t.Fatalf("expected non-nil result")
+	}
+	if result.ErrorCode != ErrorCodeInvalidArgument {
+		t.Fatalf("expected INVALID_ARGUMENT after close, got %s", result.ErrorCode)
+	}
+}
+
+func TestInvalidConfigFallsBackToDefaults(t *testing.T) {
+	engine := NewEngine(&EngineConfig{
+		ShardCount:     0,
+		QueueSize:      -1,
+		IdempotencyTTL: 0,
+	})
+	defer engine.Close()
+
+	if len(engine.shards) != DefaultEngineConfig().ShardCount {
+		t.Fatalf("expected default shard count %d, got %d", DefaultEngineConfig().ShardCount, len(engine.shards))
+	}
+
+	routerShard := engine.GetShardID("BTC-USDT")
+	if routerShard < 0 || routerShard >= len(engine.shards) {
+		t.Fatalf("router returned invalid shard id %d", routerShard)
+	}
+}
+
+func TestIdempotencyTTLExpiration(t *testing.T) {
+	engine := NewEngine(&EngineConfig{
+		ShardCount:     2,
+		QueueSize:      100,
+		IdempotencyTTL: 20 * time.Millisecond,
+	})
+	defer engine.Close()
+
+	req := &matching.PlaceOrderRequest{
+		OrderID:       "order_ttl_1",
+		ClientOrderID: "client_ttl_1",
+		AccountID:     "acc1",
+		Symbol:        "BTC-USDT",
+		Side:          matching.SideBuy,
+		PriceInt:      43000,
+		QuantityInt:   100,
+	}
+	hash, _ := ComputePayloadHash(req)
+
+	first := &CommandEnvelope{
+		CommandID:      "cmd_ttl_1",
+		CommandType:    CommandTypePlace,
+		IdempotencyKey: "idem_ttl_1",
+		Symbol:         "BTC-USDT",
+		AccountID:      "acc1",
+		PayloadHash:    hash,
+		Payload:        req,
+		CreatedAt:      time.Now(),
+	}
+	r1 := engine.Submit(first)
+	if r1.ErrorCode != ErrorCodeNone {
+		t.Fatalf("first submit failed: %v", r1.Err)
+	}
+
+	second := &CommandEnvelope{
+		CommandID:      "cmd_ttl_2",
+		CommandType:    CommandTypePlace,
+		IdempotencyKey: "idem_ttl_1",
+		Symbol:         "BTC-USDT",
+		AccountID:      "acc1",
+		PayloadHash:    hash,
+		Payload:        req,
+		CreatedAt:      time.Now(),
+	}
+	r2 := engine.Submit(second)
+	if r2.ErrorCode != ErrorCodeNone {
+		t.Fatalf("second submit should return cached success before ttl: %v", r2.Err)
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	third := &CommandEnvelope{
+		CommandID:      "cmd_ttl_3",
+		CommandType:    CommandTypePlace,
+		IdempotencyKey: "idem_ttl_1",
+		Symbol:         "BTC-USDT",
+		AccountID:      "acc1",
+		PayloadHash:    hash,
+		Payload:        req,
+		CreatedAt:      time.Now(),
+	}
+	r3 := engine.Submit(third)
+	if r3.ErrorCode == ErrorCodeNone {
+		t.Fatalf("expected execution after ttl to fail on duplicate order id, got success")
+	}
+}
+
+func TestCachedResultIsImmutableToCallerMutation(t *testing.T) {
+	engine := NewEngine(DefaultEngineConfig())
+	defer engine.Close()
+
+	req := &matching.PlaceOrderRequest{
+		OrderID:       "order_copy_1",
+		ClientOrderID: "client_copy_1",
+		AccountID:     "acc1",
+		Symbol:        "BTC-USDT",
+		Side:          matching.SideBuy,
+		PriceInt:      43000,
+		QuantityInt:   100,
+	}
+	hash, _ := ComputePayloadHash(req)
+	envelope := &CommandEnvelope{
+		CommandID:      "cmd_copy_1",
+		CommandType:    CommandTypePlace,
+		IdempotencyKey: "idem_copy_1",
+		Symbol:         "BTC-USDT",
+		AccountID:      "acc1",
+		PayloadHash:    hash,
+		Payload:        req,
+		CreatedAt:      time.Now(),
+	}
+
+	first := engine.Submit(envelope)
+	if first.ErrorCode != ErrorCodeNone {
+		t.Fatalf("first submit failed: %v", first.Err)
+	}
+	if first.Result == nil {
+		t.Fatalf("first result must not be nil")
+	}
+
+	// Mutate caller-visible object intentionally; cached result must stay unchanged.
+	first.Result.Events = append(first.Result.Events, &matching.OrderCanceledEvent{
+		EventIDValue:    "evt_fake",
+		SequenceValue:   999999,
+		SymbolValue:     "BTC-USDT",
+		OccurredAtValue: time.Now(),
+		OrderID:         "fake",
+		AccountID:       "acc1",
+		RemainingQty:    0,
+		CanceledBy:      matching.CancelReasonSystem,
+	})
+
+	second := engine.Submit(&CommandEnvelope{
+		CommandID:      "cmd_copy_2",
+		CommandType:    CommandTypePlace,
+		IdempotencyKey: "idem_copy_1",
+		Symbol:         "BTC-USDT",
+		AccountID:      "acc1",
+		PayloadHash:    hash,
+		Payload:        req,
+		CreatedAt:      time.Now(),
+	})
+
+	if second.ErrorCode != ErrorCodeNone {
+		t.Fatalf("second submit should return cached success: %v", second.Err)
+	}
+	if second.Result == nil {
+		t.Fatalf("second result must not be nil")
+	}
+	if len(second.Result.Events) != 1 {
+		t.Fatalf("cached result should not be polluted by caller mutation, got %d events", len(second.Result.Events))
 	}
 }

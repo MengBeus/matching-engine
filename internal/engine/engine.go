@@ -1,19 +1,24 @@
 package engine
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Engine manages multiple shards and routes commands to them
 type Engine struct {
-	router *Router
-	shards []*Shard
+	router    *Router
+	shards    []*Shard
+	closed    atomic.Bool
+	closeOnce sync.Once
 }
 
 // EngineConfig holds configuration for the engine
 type EngineConfig struct {
-	ShardCount    int           // Number of shards (default: 8)
-	QueueSize     int           // Command queue size per shard (default: 1000)
+	ShardCount     int           // Number of shards (default: 8)
+	QueueSize      int           // Command queue size per shard (default: 1000)
 	IdempotencyTTL time.Duration // Idempotency record TTL (default: 24h)
 }
 
@@ -28,17 +33,15 @@ func DefaultEngineConfig() *EngineConfig {
 
 // NewEngine creates a new engine with the given configuration
 func NewEngine(config *EngineConfig) *Engine {
-	if config == nil {
-		config = DefaultEngineConfig()
-	}
+	cfg := normalizeEngineConfig(config)
 
 	// Create router
-	router := NewRouter(config.ShardCount)
+	router := NewRouter(cfg.ShardCount)
 
 	// Create shards
-	shards := make([]*Shard, config.ShardCount)
-	for i := 0; i < config.ShardCount; i++ {
-		shards[i] = NewShard(i, config.QueueSize, config.IdempotencyTTL)
+	shards := make([]*Shard, cfg.ShardCount)
+	for i := 0; i < cfg.ShardCount; i++ {
+		shards[i] = NewShard(i, cfg.QueueSize, cfg.IdempotencyTTL)
 		shards[i].Start()
 	}
 
@@ -50,8 +53,27 @@ func NewEngine(config *EngineConfig) *Engine {
 
 // Submit submits a command to the appropriate shard and returns the result
 func (e *Engine) Submit(envelope *CommandEnvelope) *CommandExecResult {
+	if envelope == nil {
+		return &CommandExecResult{
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("command envelope is nil"),
+		}
+	}
+	if e.closed.Load() {
+		return &CommandExecResult{
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("engine is closed"),
+		}
+	}
+
 	// Route to shard
 	shardID := e.router.Route(envelope.Symbol)
+	if shardID < 0 || shardID >= len(e.shards) {
+		return &CommandExecResult{
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("invalid shard id: %d", shardID),
+		}
+	}
 	shard := e.shards[shardID]
 
 	// Submit to shard
@@ -61,4 +83,34 @@ func (e *Engine) Submit(envelope *CommandEnvelope) *CommandExecResult {
 // GetShardID returns the shard ID for a given symbol (for testing)
 func (e *Engine) GetShardID(symbol string) int {
 	return e.router.Route(symbol)
+}
+
+// Close gracefully stops all shards.
+func (e *Engine) Close() {
+	e.closeOnce.Do(func() {
+		e.closed.Store(true)
+		for _, shard := range e.shards {
+			shard.Stop()
+		}
+	})
+}
+
+func normalizeEngineConfig(config *EngineConfig) EngineConfig {
+	defaults := DefaultEngineConfig()
+	if config == nil {
+		return *defaults
+	}
+
+	normalized := *config
+	if normalized.ShardCount <= 0 {
+		normalized.ShardCount = defaults.ShardCount
+	}
+	if normalized.QueueSize < 0 {
+		normalized.QueueSize = defaults.QueueSize
+	}
+	if normalized.IdempotencyTTL <= 0 {
+		normalized.IdempotencyTTL = defaults.IdempotencyTTL
+	}
+
+	return normalized
 }

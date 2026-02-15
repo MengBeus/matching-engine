@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"matching-engine/internal/matching"
 )
 
 // IdempotencyKey represents the composite key for idempotency checking
@@ -23,11 +21,9 @@ func (k IdempotencyKey) String() string {
 
 // IdempotencyRecord stores the cached result of a command execution
 type IdempotencyRecord struct {
-	PayloadHash string                  // Hash of the original payload
-	Result      *matching.CommandResult // Cached execution result
-	ErrorCode   ErrorCode               // Cached error code
-	Err         error                   // Cached error
-	ExpiresAt   time.Time               // Expiration time
+	PayloadHash string             // Hash of the original payload
+	Result      *CommandExecResult // Cached execution result
+	ExpiresAt   time.Time          // Expiration time
 }
 
 // IdempotencyStore manages idempotency records
@@ -51,8 +47,8 @@ func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
 // - (result, nil) if duplicate with same payload (return cached result)
 // - (nil, error) if conflict with different payload
 func (s *IdempotencyStore) Check(key IdempotencyKey, payloadHash string) (*CommandExecResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	keyStr := key.String()
 	record, exists := s.records[keyStr]
@@ -63,7 +59,8 @@ func (s *IdempotencyStore) Check(key IdempotencyKey, payloadHash string) (*Comma
 
 	// Check if expired
 	if time.Now().After(record.ExpiresAt) {
-		// Expired, treat as not seen
+		// Expired, delete stale record and treat as not seen
+		delete(s.records, keyStr)
 		return nil, nil
 	}
 
@@ -74,11 +71,7 @@ func (s *IdempotencyStore) Check(key IdempotencyKey, payloadHash string) (*Comma
 	}
 
 	// Duplicate: return cached result
-	return &CommandExecResult{
-		Result:    record.Result,
-		ErrorCode: record.ErrorCode,
-		Err:       record.Err,
-	}, nil
+	return cloneCommandExecResult(record.Result), nil
 }
 
 // Store stores the execution result for future idempotency checks
@@ -89,9 +82,7 @@ func (s *IdempotencyStore) Store(key IdempotencyKey, payloadHash string, result 
 	keyStr := key.String()
 	s.records[keyStr] = &IdempotencyRecord{
 		PayloadHash: payloadHash,
-		Result:      result.Result,
-		ErrorCode:   result.ErrorCode,
-		Err:         result.Err,
+		Result:      cloneCommandExecResult(result),
 		ExpiresAt:   time.Now().Add(s.ttl),
 	}
 }

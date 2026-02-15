@@ -4,10 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"matching-engine/internal/matching"
 )
+
+const defaultIdempotencyCleanupInterval = time.Minute
 
 // Shard represents a single shard that processes commands for specific symbols
 type Shard struct {
@@ -15,6 +19,10 @@ type Shard struct {
 	cmdQueue  chan *commandRequest
 	books     map[string]*matching.OrderBook
 	idemStore *IdempotencyStore
+
+	submitMu sync.RWMutex
+	stopped  bool
+	wg       sync.WaitGroup
 }
 
 // commandRequest wraps a command with a response channel
@@ -35,31 +43,88 @@ func NewShard(id int, queueSize int, idemTTL time.Duration) *Shard {
 
 // Start starts the shard's event loop in a goroutine
 func (s *Shard) Start() {
+	s.wg.Add(1)
 	go s.eventLoop()
+}
+
+// Stop gracefully stops the shard event loop.
+func (s *Shard) Stop() {
+	s.submitMu.Lock()
+	if s.stopped {
+		s.submitMu.Unlock()
+		return
+	}
+	s.stopped = true
+	close(s.cmdQueue)
+	s.submitMu.Unlock()
+
+	s.wg.Wait()
 }
 
 // Submit submits a command to the shard and waits for the result
 func (s *Shard) Submit(envelope *CommandEnvelope) *CommandExecResult {
+	if envelope == nil {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("command envelope is nil"),
+		}
+	}
+
 	respChan := make(chan *CommandExecResult, 1)
 	req := &commandRequest{
 		envelope: envelope,
 		respChan: respChan,
 	}
 
+	s.submitMu.RLock()
+	if s.stopped {
+		s.submitMu.RUnlock()
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("shard is stopped"),
+		}
+	}
 	s.cmdQueue <- req
+	s.submitMu.RUnlock()
 	return <-respChan
 }
 
 // eventLoop is the main event loop that processes commands serially
 func (s *Shard) eventLoop() {
-	for req := range s.cmdQueue {
-		result := s.processCommand(req.envelope)
-		req.respChan <- result
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(defaultIdempotencyCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case req, ok := <-s.cmdQueue:
+			if !ok {
+				return
+			}
+			if req == nil {
+				continue
+			}
+			result := s.processCommand(req.envelope)
+			req.respChan <- result
+		case <-ticker.C:
+			s.idemStore.Cleanup()
+		}
 	}
 }
 
 // processCommand processes a single command
 func (s *Shard) processCommand(envelope *CommandEnvelope) *CommandExecResult {
+	if envelope == nil {
+		return &CommandExecResult{
+			Result:    nil,
+			ErrorCode: ErrorCodeInvalidArgument,
+			Err:       fmt.Errorf("command envelope is nil"),
+		}
+	}
+
 	// Build idempotency key
 	idemKey := IdempotencyKey{
 		AccountID:      envelope.AccountID,
@@ -182,40 +247,24 @@ func (s *Shard) executeCancel(envelope *CommandEnvelope) *CommandExecResult {
 
 // mapErrorCode maps matching engine errors to error codes
 func (s *Shard) mapErrorCode(err error) ErrorCode {
-	errMsg := err.Error()
+	errMsg := strings.ToLower(err.Error())
 
 	// Check for specific error patterns
-	if contains(errMsg, "not found") {
+	if strings.Contains(errMsg, "not found") {
 		return ErrorCodeOrderNotFound
 	}
-	if contains(errMsg, "unauthorized") || contains(errMsg, "different account") {
+	if strings.Contains(errMsg, "unauthorized") || strings.Contains(errMsg, "different account") {
 		return ErrorCodeUnauthorized
 	}
-	if contains(errMsg, "already filled") || contains(errMsg, "filled order") {
+	if strings.Contains(errMsg, "already filled") || strings.Contains(errMsg, "filled order") {
 		return ErrorCodeOrderAlreadyFilled
 	}
-	if contains(errMsg, "already canceled") {
+	if strings.Contains(errMsg, "already canceled") {
 		return ErrorCodeOrderAlreadyCanceled
 	}
 
 	// Default to invalid argument
 	return ErrorCodeInvalidArgument
-}
-
-// contains checks if a string contains a substring (case-insensitive helper)
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-		findSubstring(s, substr)))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // ComputePayloadHash computes SHA256 hash of the payload

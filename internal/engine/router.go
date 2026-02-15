@@ -11,6 +11,9 @@ type Router struct {
 
 // NewRouter creates a new router with the specified shard count
 func NewRouter(shardCount int) *Router {
+	if shardCount <= 0 {
+		shardCount = 1
+	}
 	return &Router{
 		shardCount: shardCount,
 	}
@@ -19,7 +22,10 @@ func NewRouter(shardCount int) *Router {
 // Route calculates the shard ID for a given symbol
 // Uses FNV-1a hash for stable, deterministic routing
 func (r *Router) Route(symbol string) int {
+	if r.shardCount <= 0 {
+		return 0
+	}
 	h := fnv.New32a()
-	h.Write([]byte(symbol))
+	_, _ = h.Write([]byte(symbol))
 	return int(h.Sum32()) % r.shardCount
 }
