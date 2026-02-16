@@ -1,11 +1,24 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"matching-engine/internal/matching"
 )
+
+// EventStore defines the minimal interface needed for event persistence
+type EventStore interface {
+	Append(ctx context.Context, symbol string, event matching.Event) error
+}
+
+// SnapshotStore defines the minimal interface needed for snapshot persistence
+type SnapshotStore interface {
+	Save(ctx context.Context, snapshot any) error
+}
 
 // Engine manages multiple shards and routes commands to them
 type Engine struct {
@@ -93,6 +106,40 @@ func (e *Engine) Close() {
 			shard.Stop()
 		}
 	})
+}
+
+// RecoverSymbol recovers a single symbol by replaying events
+// This should be called before the engine starts processing new commands
+func (e *Engine) RecoverSymbol(symbol string, events []matching.Event) error {
+	if e.closed.Load() {
+		return fmt.Errorf("engine is closed")
+	}
+
+	// Route to shard
+	shardID := e.router.Route(symbol)
+	if shardID < 0 || shardID >= len(e.shards) {
+		return fmt.Errorf("invalid shard id: %d", shardID)
+	}
+	shard := e.shards[shardID]
+
+	// Replay events in the shard
+	return shard.ReplayEvents(symbol, events)
+}
+
+// SetEventStore sets the event store for all shards
+// This should be called before the engine starts processing commands
+func (e *Engine) SetEventStore(eventStore EventStore) {
+	for _, shard := range e.shards {
+		shard.SetEventStore(eventStore)
+	}
+}
+
+// SetSnapshotStore sets the snapshot store for all shards
+// This should be called before the engine starts processing commands
+func (e *Engine) SetSnapshotStore(snapshotStore SnapshotStore) {
+	for _, shard := range e.shards {
+		shard.SetSnapshotStore(snapshotStore)
+	}
 }
 
 func normalizeEngineConfig(config *EngineConfig) EngineConfig {

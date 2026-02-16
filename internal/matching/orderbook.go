@@ -527,3 +527,13 @@ func (ob *OrderBook) buildOrderSnapshot(order *Order) *OrderSnapshot {
 		CreatedAt:     order.CreatedAt,
 	}
 }
+
+// SetEventSequence sets the event sequence number (used during recovery)
+func (ob *OrderBook) SetEventSequence(seq int64) {
+	ob.eventSeq = seq
+}
+
+// GetEventSequence returns the current event sequence number
+func (ob *OrderBook) GetEventSequence() int64 {
+	return ob.eventSeq
+}
