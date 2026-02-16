@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"matching-engine/internal/account"
 	"matching-engine/internal/api"
 	"matching-engine/internal/engine"
+	"matching-engine/internal/matching"
 	"matching-engine/internal/persistence"
 )
 
@@ -28,6 +31,8 @@ func main() {
 
 	// Initialize account service
 	accountSvc := account.NewMemoryService()
+	// Initialize test accounts for development/testing before replaying events.
+	initTestAccounts(accountSvc)
 
 	// Initialize engine
 	eng := engine.NewEngine(&engine.EngineConfig{
@@ -44,12 +49,9 @@ func main() {
 	eng.SetSnapshotStore(snapshotStore)
 
 	// Perform recovery
-	if err := performRecovery(ctx, eng, eventStore, recoveryService); err != nil {
+	if err := performRecovery(ctx, eng, accountSvc, eventStore, recoveryService); err != nil {
 		log.Fatalf("Failed to recover engine state: %v", err)
 	}
-
-	// Initialize test accounts for development/testing
-	initTestAccounts(accountSvc)
 
 	// Create router
 	router := api.NewRouter(accountSvc, eng)
@@ -81,7 +83,13 @@ func initPersistence(dataDir string) (persistence.EventStore, persistence.Snapsh
 	return eventStore, snapshotStore, recoveryService, nil
 }
 
-func performRecovery(ctx context.Context, eng *engine.Engine, eventStore persistence.EventStore, recoveryService persistence.RecoveryService) error {
+func performRecovery(
+	ctx context.Context,
+	eng *engine.Engine,
+	accountSvc account.Service,
+	eventStore persistence.EventStore,
+	recoveryService persistence.RecoveryService,
+) error {
 	// List all symbols that have event logs
 	symbols, err := eventStore.ListSymbols(ctx)
 	if err != nil {
@@ -108,6 +116,13 @@ func performRecovery(ctx context.Context, eng *engine.Engine, eventStore persist
 		// Log recovery info
 		if snapshot != nil {
 			log.Printf("  Loaded snapshot at sequence %d", snapshot.LastSequence)
+			state, err := decodeOrderBookState(snapshot.Orderbook, symbol)
+			if err != nil {
+				return fmt.Errorf("failed to decode snapshot for %s: %w", symbol, err)
+			}
+			if err := eng.LoadSymbolSnapshot(symbol, state, snapshot.LastSequence); err != nil {
+				return fmt.Errorf("failed to load snapshot for %s: %w", symbol, err)
+			}
 		}
 		log.Printf("  Replaying %d events", len(events))
 
@@ -116,10 +131,119 @@ func performRecovery(ctx context.Context, eng *engine.Engine, eventStore persist
 			return err
 		}
 
+		// Recover account balances/freezes from full event history.
+		allEvents, err := eventStore.ReadFrom(ctx, symbol, 1)
+		if err != nil {
+			return fmt.Errorf("failed to read account recovery events for %s: %w", symbol, err)
+		}
+		if len(allEvents) > 0 && allEvents[0].Sequence() != 1 {
+			return fmt.Errorf("account recovery start sequence mismatch for %s: expected 1, got %d", symbol, allEvents[0].Sequence())
+		}
+		if err := recoveryService.ValidateSequence(allEvents); err != nil {
+			return fmt.Errorf("account recovery sequence validation failed for %s: %w", symbol, err)
+		}
+		if err := replayAccountEvents(accountSvc, symbol, allEvents); err != nil {
+			return fmt.Errorf("account recovery failed for %s: %w", symbol, err)
+		}
+
 		log.Printf("  Successfully recovered %s", symbol)
 	}
 
 	log.Printf("Recovery completed for %d symbols", len(symbols))
+	return nil
+}
+
+func decodeOrderBookState(raw any, symbol string) (*matching.OrderBookState, error) {
+	if raw == nil {
+		return nil, nil
+	}
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	var state matching.OrderBookState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+	if state.Symbol == "" {
+		state.Symbol = symbol
+	}
+
+	return &state, nil
+}
+
+func replayAccountEvents(accountSvc account.Service, symbol string, events []matching.Event) error {
+	type orderMeta struct {
+		accountID string
+		side      matching.Side
+	}
+
+	orderLookup := make(map[string]orderMeta)
+	for _, event := range events {
+		switch e := event.(type) {
+		case *matching.OrderAcceptedEvent:
+			intent := account.PlaceIntent{
+				AccountID: e.AccountID,
+				OrderID:   e.OrderID,
+				Symbol:    symbol,
+				Side:      string(e.Side),
+				PriceInt:  e.Price,
+				QtyInt:    e.Quantity,
+			}
+			if err := accountSvc.CheckAndFreezeForPlace(intent); err != nil {
+				return fmt.Errorf("freeze failed for order %s: %w", e.OrderID, err)
+			}
+			orderLookup[e.OrderID] = orderMeta{accountID: e.AccountID, side: e.Side}
+
+		case *matching.OrderMatchedEvent:
+			maker, ok := orderLookup[e.MakerOrderID]
+			if !ok {
+				return fmt.Errorf("missing maker order metadata for %s", e.MakerOrderID)
+			}
+			taker, ok := orderLookup[e.TakerOrderID]
+			if !ok {
+				return fmt.Errorf("missing taker order metadata for %s", e.TakerOrderID)
+			}
+
+			tradeIntent := account.TradeIntent{
+				TradeID:     e.TradeID,
+				Symbol:      symbol,
+				PriceInt:    e.Price,
+				QuantityInt: e.Quantity,
+			}
+
+			if maker.side == matching.SideBuy {
+				tradeIntent.BuyerAccountID = maker.accountID
+				tradeIntent.BuyerOrderID = e.MakerOrderID
+				tradeIntent.SellerAccountID = taker.accountID
+				tradeIntent.SellerOrderID = e.TakerOrderID
+			} else {
+				tradeIntent.BuyerAccountID = taker.accountID
+				tradeIntent.BuyerOrderID = e.TakerOrderID
+				tradeIntent.SellerAccountID = maker.accountID
+				tradeIntent.SellerOrderID = e.MakerOrderID
+			}
+
+			if err := accountSvc.ApplyTrade(tradeIntent); err != nil {
+				return fmt.Errorf("trade apply failed for %s: %w", e.TradeID, err)
+			}
+
+		case *matching.OrderCanceledEvent:
+			cancelIntent := account.CancelIntent{
+				AccountID: e.AccountID,
+				OrderID:   e.OrderID,
+				Symbol:    symbol,
+			}
+			if err := accountSvc.ReleaseOnCancel(cancelIntent); err != nil {
+				return fmt.Errorf("cancel release failed for order %s: %w", e.OrderID, err)
+			}
+		default:
+			return fmt.Errorf("unknown event type: %T", e)
+		}
+	}
+
 	return nil
 }
 

@@ -32,6 +32,7 @@ const (
 	ErrorCodeNone                 ErrorCode = ""
 	ErrorCodeDuplicateRequest     ErrorCode = "DUPLICATE_REQUEST"
 	ErrorCodeInvalidArgument      ErrorCode = "INVALID_ARGUMENT"
+	ErrorCodeInternalError        ErrorCode = "INTERNAL_ERROR"
 	ErrorCodeOrderNotFound        ErrorCode = "ORDER_NOT_FOUND"
 	ErrorCodeOrderAlreadyFilled   ErrorCode = "ORDER_ALREADY_FILLED"
 	ErrorCodeOrderAlreadyCanceled ErrorCode = "ORDER_ALREADY_CANCELED"

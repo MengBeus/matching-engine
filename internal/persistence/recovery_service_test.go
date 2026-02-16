@@ -255,3 +255,46 @@ func TestFileRecoveryService_RecoverNewSymbol(t *testing.T) {
 		t.Errorf("expected 0 events, got %d", len(events))
 	}
 }
+
+func TestFileRecoveryService_RecoverStartSequenceMismatch(t *testing.T) {
+	tempDir := t.TempDir()
+
+	eventStore, err := NewFileEventStore(filepath.Join(tempDir, "events"))
+	if err != nil {
+		t.Fatalf("failed to create event store: %v", err)
+	}
+	defer eventStore.Close()
+
+	snapshotStore, err := NewFileSnapshotStore(filepath.Join(tempDir, "snapshots"))
+	if err != nil {
+		t.Fatalf("failed to create snapshot store: %v", err)
+	}
+	defer snapshotStore.Close()
+
+	recoveryService := NewFileRecoveryService(eventStore, snapshotStore)
+	ctx := context.Background()
+	symbol := "BTC-USDT"
+
+	// Intentionally append sequence 2 only to simulate truncated log.
+	event := &matching.OrderAcceptedEvent{
+		EventIDValue:    "evt-2",
+		SequenceValue:   2,
+		SymbolValue:     symbol,
+		OccurredAtValue: time.Now(),
+		OrderID:         "order-2",
+		ClientOrderID:   "client-2",
+		AccountID:       "acc-1",
+		Side:            matching.SideBuy,
+		Price:           100000,
+		Quantity:        10000,
+		Status:          matching.OrderStatusNew,
+	}
+	if err := eventStore.Append(ctx, symbol, event); err != nil {
+		t.Fatalf("failed to append event: %v", err)
+	}
+
+	_, _, err = recoveryService.Recover(ctx, symbol)
+	if err == nil {
+		t.Fatal("expected recover error on start sequence mismatch")
+	}
+}

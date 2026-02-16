@@ -126,6 +126,21 @@ func (e *Engine) RecoverSymbol(symbol string, events []matching.Event) error {
 	return shard.ReplayEvents(symbol, events)
 }
 
+// LoadSymbolSnapshot loads a symbol snapshot into the target shard before replay.
+func (e *Engine) LoadSymbolSnapshot(symbol string, state *matching.OrderBookState, lastSequence int64) error {
+	if e.closed.Load() {
+		return fmt.Errorf("engine is closed")
+	}
+
+	shardID := e.router.Route(symbol)
+	if shardID < 0 || shardID >= len(e.shards) {
+		return fmt.Errorf("invalid shard id: %d", shardID)
+	}
+	shard := e.shards[shardID]
+
+	return shard.LoadSnapshot(symbol, state, lastSequence)
+}
+
 // SetEventStore sets the event store for all shards
 // This should be called before the engine starts processing commands
 func (e *Engine) SetEventStore(eventStore EventStore) {

@@ -239,13 +239,13 @@ func (s *Shard) executePlace(envelope *CommandEnvelope) *CommandExecResult {
 				// TODO: Implement proper transaction handling
 				return &CommandExecResult{
 					Result:    nil,
-					ErrorCode: ErrorCodeInvalidArgument,
+					ErrorCode: ErrorCodeInternalError,
 					Err:       fmt.Errorf("failed to persist event: %w", err),
 				}
 			}
-			// Check if snapshot should be created after each event
-			s.checkAndCreateSnapshot(envelope.Symbol)
 		}
+		lastSeq := matchResult.Events[len(matchResult.Events)-1].Sequence()
+		s.checkAndCreateSnapshot(envelope.Symbol, len(matchResult.Events), lastSeq)
 	}
 
 	return &CommandExecResult{
@@ -294,13 +294,13 @@ func (s *Shard) executeCancel(envelope *CommandEnvelope) *CommandExecResult {
 			if err := s.eventStore.Append(ctx, envelope.Symbol, event); err != nil {
 				return &CommandExecResult{
 					Result:    nil,
-					ErrorCode: ErrorCodeInvalidArgument,
+					ErrorCode: ErrorCodeInternalError,
 					Err:       fmt.Errorf("failed to persist event: %w", err),
 				}
 			}
-			// Check if snapshot should be created after each event
-			s.checkAndCreateSnapshot(envelope.Symbol)
 		}
+		lastSeq := matchResult.Events[len(matchResult.Events)-1].Sequence()
+		s.checkAndCreateSnapshot(envelope.Symbol, len(matchResult.Events), lastSeq)
 	}
 
 	return &CommandExecResult{
@@ -402,6 +402,28 @@ func ComputePayloadHash(payload any) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
+// LoadSnapshot restores a symbol's orderbook from snapshot state.
+func (s *Shard) LoadSnapshot(symbol string, state *matching.OrderBookState, lastSequence int64) error {
+	book, exists := s.books[symbol]
+	if !exists {
+		book = matching.NewOrderBook(symbol)
+		s.books[symbol] = book
+	}
+
+	if state != nil {
+		if err := book.ImportState(state); err != nil {
+			return fmt.Errorf("failed to import orderbook state: %w", err)
+		}
+	}
+
+	// Keep sequence monotonic even when loading older/legacy snapshot payload.
+	if book.GetEventSequence() < lastSequence {
+		book.SetEventSequence(lastSequence)
+	}
+
+	return nil
+}
+
 // ReplayEvents replays a batch of events to rebuild orderbook state
 // This is used during recovery to restore state from event log
 func (s *Shard) ReplayEvents(symbol string, events []matching.Event) error {
@@ -432,7 +454,8 @@ func (s *Shard) ReplayEvents(symbol string, events []matching.Event) error {
 				return fmt.Errorf("failed to replay OrderAccepted(seq=%d): %w", e.Sequence(), err)
 			}
 		case *matching.OrderMatchedEvent:
-			// OrderMatched events are side effects of PlaceLimit, skip during replay
+			// OrderMatched is derived from OrderAccepted replay via deterministic matching.
+			// We still advance maxSeq to keep sequence monotonic.
 			continue
 		case *matching.OrderCanceledEvent:
 			if err := s.replayOrderCanceled(book, e); err != nil {
@@ -484,7 +507,7 @@ func (s *Shard) replayOrderCanceled(book *matching.OrderBook, event *matching.Or
 		// This is expected, so we can ignore certain errors
 		errMsg := strings.ToLower(err.Error())
 		if strings.Contains(errMsg, "not found") ||
-		   strings.Contains(errMsg, "already") {
+			strings.Contains(errMsg, "already") {
 			return nil
 		}
 		return err
@@ -492,38 +515,43 @@ func (s *Shard) replayOrderCanceled(book *matching.OrderBook, event *matching.Or
 	return nil
 }
 
-// checkAndCreateSnapshot checks if snapshot should be created and creates it
-func (s *Shard) checkAndCreateSnapshot(symbol string) {
+// checkAndCreateSnapshot checks if snapshot should be created and creates it.
+func (s *Shard) checkAndCreateSnapshot(symbol string, persistedEvents int, lastPersistedSeq int64) {
 	if s.snapshotStore == nil {
 		return
 	}
+	if persistedEvents <= 0 {
+		return
+	}
 
-	// Increment event counter
-	s.eventCounters[symbol]++
+	// Increment event counter.
+	s.eventCounters[symbol] += int64(persistedEvents)
 
 	// Check if we should create a snapshot
 	if s.eventCounters[symbol] >= s.snapshotInterval {
-		s.createSnapshot(symbol)
-		s.eventCounters[symbol] = 0 // Reset counter
+		s.createSnapshot(symbol, lastPersistedSeq)
+		s.eventCounters[symbol] = s.eventCounters[symbol] % s.snapshotInterval
 	}
 }
 
 // createSnapshot creates a snapshot for a symbol
-func (s *Shard) createSnapshot(symbol string) {
+func (s *Shard) createSnapshot(symbol string, lastPersistedSeq int64) {
 	book, exists := s.books[symbol]
 	if !exists {
 		return
 	}
 
-	// Create simplified snapshot (MVP: only sequence number)
-	// In production, this should include full orderbook state
+	state := book.ExportState()
+	if state.EventSeq < lastPersistedSeq {
+		state.EventSeq = lastPersistedSeq
+	}
+
 	snapshot := &Snapshot{
 		Version:      1,
 		Symbol:       symbol,
-		LastSequence: book.GetEventSequence(),
+		LastSequence: state.EventSeq,
 		CapturedAt:   time.Now(),
-		// Orderbook, ClosedOrders, AccountBalances omitted for MVP
-		// Can be reconstructed through event replay
+		Orderbook:    state,
 	}
 
 	ctx := context.Background()
@@ -536,8 +564,9 @@ func (s *Shard) createSnapshot(symbol string) {
 
 // Snapshot represents a simplified snapshot structure
 type Snapshot struct {
-	Version      int       `json:"version"`
-	Symbol       string    `json:"symbol"`
-	LastSequence int64     `json:"last_sequence"`
-	CapturedAt   time.Time `json:"captured_at"`
+	Version      int                      `json:"version"`
+	Symbol       string                   `json:"symbol"`
+	LastSequence int64                    `json:"last_sequence"`
+	CapturedAt   time.Time                `json:"captured_at"`
+	Orderbook    *matching.OrderBookState `json:"orderbook,omitempty"`
 }

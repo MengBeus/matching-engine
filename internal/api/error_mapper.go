@@ -122,6 +122,12 @@ func MapEngineErrorToHTTP(errorCode engine.ErrorCode, err error) (int, ErrorResp
 			Message: getErrorMessage(err, "duplicate request with different payload"),
 		}
 
+	case engine.ErrorCodeInternalError:
+		return http.StatusInternalServerError, ErrorResponse{
+			Code:    string(ErrorCodeInternalError),
+			Message: getErrorMessage(err, "internal error"),
+		}
+
 	default:
 		return http.StatusInternalServerError, ErrorResponse{
 			Code:    string(ErrorCodeInternalError),

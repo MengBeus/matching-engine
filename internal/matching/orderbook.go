@@ -3,6 +3,7 @@ package matching
 import (
 	"container/list"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -536,4 +537,126 @@ func (ob *OrderBook) SetEventSequence(seq int64) {
 // GetEventSequence returns the current event sequence number
 func (ob *OrderBook) GetEventSequence() int64 {
 	return ob.eventSeq
+}
+
+// OrderState is a serializable representation of an active order.
+type OrderState struct {
+	OrderID       string      `json:"order_id"`
+	ClientOrderID string      `json:"client_order_id"`
+	AccountID     string      `json:"account_id"`
+	Symbol        string      `json:"symbol"`
+	Side          Side        `json:"side"`
+	Price         int64       `json:"price"`
+	Quantity      int64       `json:"quantity"`
+	RemainingQty  int64       `json:"remaining_qty"`
+	Status        OrderStatus `json:"status"`
+	CreatedAt     time.Time   `json:"created_at"`
+}
+
+// OrderBookState is a serializable representation of orderbook state.
+type OrderBookState struct {
+	Symbol       string                   `json:"symbol"`
+	EventSeq     int64                    `json:"event_seq"`
+	TradeSeq     int64                    `json:"trade_seq"`
+	Orders       []OrderState             `json:"orders"`
+	ClosedOrders map[string]OrderSnapshot `json:"closed_orders"`
+}
+
+// ExportState exports the current orderbook state for snapshotting.
+func (ob *OrderBook) ExportState() *OrderBookState {
+	orders := make([]OrderState, 0, len(ob.Orders))
+	for _, order := range ob.Orders {
+		orders = append(orders, OrderState{
+			OrderID:       order.OrderID,
+			ClientOrderID: order.ClientOrderID,
+			AccountID:     order.AccountID,
+			Symbol:        order.Symbol,
+			Side:          order.Side,
+			Price:         order.Price,
+			Quantity:      order.Quantity,
+			RemainingQty:  order.RemainingQty,
+			Status:        order.Status,
+			CreatedAt:     order.CreatedAt,
+		})
+	}
+
+	closed := make(map[string]OrderSnapshot, len(ob.closedOrders))
+	for orderID, snap := range ob.closedOrders {
+		if snap == nil {
+			continue
+		}
+		closed[orderID] = *snap
+	}
+
+	return &OrderBookState{
+		Symbol:       ob.Symbol,
+		EventSeq:     ob.eventSeq,
+		TradeSeq:     ob.tradeSeq,
+		Orders:       orders,
+		ClosedOrders: closed,
+	}
+}
+
+// ImportState imports a previously exported state.
+func (ob *OrderBook) ImportState(state *OrderBookState) error {
+	if state == nil {
+		return fmt.Errorf("orderbook state is nil")
+	}
+	if state.Symbol != "" && state.Symbol != ob.Symbol {
+		return fmt.Errorf("symbol mismatch: state %s, orderbook %s", state.Symbol, ob.Symbol)
+	}
+
+	ob.BidLevels = make(map[int64]*PriceLevel)
+	ob.AskLevels = make(map[int64]*PriceLevel)
+	ob.Orders = make(map[string]*Order)
+	ob.closedOrders = make(map[string]*OrderSnapshot, len(state.ClosedOrders))
+
+	for orderID, snap := range state.ClosedOrders {
+		s := snap
+		ob.closedOrders[orderID] = &s
+	}
+
+	orders := make([]OrderState, len(state.Orders))
+	copy(orders, state.Orders)
+	sort.Slice(orders, func(i, j int) bool {
+		oi := orders[i]
+		oj := orders[j]
+		if oi.Side != oj.Side {
+			return oi.Side < oj.Side
+		}
+		if oi.Price != oj.Price {
+			return oi.Price < oj.Price
+		}
+		if !oi.CreatedAt.Equal(oj.CreatedAt) {
+			return oi.CreatedAt.Before(oj.CreatedAt)
+		}
+		return oi.OrderID < oj.OrderID
+	})
+
+	for _, os := range orders {
+		symbol := os.Symbol
+		if symbol == "" {
+			symbol = ob.Symbol
+		}
+
+		order := &Order{
+			OrderID:       os.OrderID,
+			ClientOrderID: os.ClientOrderID,
+			AccountID:     os.AccountID,
+			Symbol:        symbol,
+			Side:          os.Side,
+			Price:         os.Price,
+			Quantity:      os.Quantity,
+			RemainingQty:  os.RemainingQty,
+			Status:        os.Status,
+			CreatedAt:     os.CreatedAt,
+		}
+		ob.Orders[order.OrderID] = order
+		level := ob.getOrCreatePriceLevel(order.Side, order.Price)
+		level.AddOrder(order)
+	}
+
+	ob.eventSeq = state.EventSeq
+	ob.tradeSeq = state.TradeSeq
+	return nil
 }

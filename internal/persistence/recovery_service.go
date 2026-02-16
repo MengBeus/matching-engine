@@ -41,6 +41,9 @@ func (s *FileRecoveryService) Recover(ctx context.Context, symbol string) (*Snap
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read events: %w", err)
 	}
+	if len(events) > 0 && events[0].Sequence() != fromSeq {
+		return nil, nil, fmt.Errorf("sequence mismatch at start: expected %d, got %d", fromSeq, events[0].Sequence())
+	}
 
 	// Step 3: Validate sequence continuity
 	if err := s.ValidateSequence(events); err != nil {
